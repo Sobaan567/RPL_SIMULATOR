@@ -3,7 +3,7 @@ import { useState, useEffect, useRef } from "react";
 const BATTERY_CAP = 100;
 const INF = 9999;
 const BASE_STATION_ID = "__base_station__";
-const API_BASE = "http://127.0.0.1:8000";
+const API_BASE = import.meta.env.VITE_API_BASE || "http://127.0.0.1:8000";
 function dist(a, b) { return Math.hypot(a.x - b.x, a.y - b.y); }
 
 function getBaseStationPos(W, H) {
