@@ -1315,10 +1315,10 @@ export default function RPLSimulator() {
             onMouseMove={onMouseMove} onMouseDown={onMouseDown} onMouseUp={onMouseUp}
             onMouseLeave={()=>{ setHovNode(null); setHovBaseStation(false); if(cvRef.current) cvRef.current.style.cursor="default"; }} />
 
-          <div style={{ position:"absolute",top:14,left:"50%",transform:"translateX(-50%)",minWidth:280,background:C.overlayBgStrong,border:`1px solid ${statusBanner.color}66`,borderRadius:12,padding:"10px 16px",boxShadow:`0 14px 42px ${statusBanner.color}22`,backdropFilter:"blur(12px)",pointerEvents:"none",display:"flex",alignItems:"center",gap:12 }}>
+          <div style={{ position:"absolute",right:14,bottom:14,width:"min(260px, calc(100% - 28px))",background:C.overlayBgStrong,border:`1px solid ${statusBanner.color}66`,borderRadius:8,padding:"8px 12px",boxShadow:`0 10px 30px ${statusBanner.color}1f`,backdropFilter:"blur(12px)",pointerEvents:"none",display:"flex",alignItems:"center",gap:10 }}>
             <span style={{ width:10,height:10,borderRadius:"50%",background:statusBanner.color,boxShadow:`0 0 18px ${statusBanner.color}` }} />
-            <div style={{ textAlign:"left" }}>
-              <div style={{ fontSize:11,fontWeight:900,color:statusBanner.color,letterSpacing:".08em" }}>{statusBanner.title}</div>
+            <div style={{ textAlign:"left",minWidth:0 }}>
+              <div style={{ fontSize:10,fontWeight:900,color:statusBanner.color,letterSpacing:".08em",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis" }}>{statusBanner.title}</div>
               <div style={{ fontSize:10,color:C.tx3,marginTop:2 }}>{statusBanner.detail}</div>
             </div>
           </div>
