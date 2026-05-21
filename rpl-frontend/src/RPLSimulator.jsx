@@ -1420,8 +1420,9 @@ export default function RPLSimulator() {
           </svg>
 
           <div style={{ position:"absolute",bottom:12,left:"50%",transform:"translateX(-50%)",background:C.panelBg,border:`1px solid ${C.br}`,borderRadius:8,padding:"7px 16px",color:C.tx2,fontSize:12,fontWeight:800,boxShadow:C.subtleShadow,pointerEvents:"none",zIndex:5 }}>
-            Made By Sobaan
+            Made By Syed Sobaan Najmi 😉
           </div>
+
         </div>
 
         {/* RIGHT PANEL */}
@@ -1677,9 +1678,6 @@ export default function RPLSimulator() {
           </div>
         </div>
       </div>
-      <footer style={{ flexShrink:0,padding:"8px 16px",background:C.topBg,borderTop:`1px solid ${C.br}`,color:C.tx3,fontSize:11,fontWeight:700,textAlign:"center",letterSpacing:0 }}>
-        Made By Sobaan
-      </footer>
     </div>
   );
 }
