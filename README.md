@@ -2,6 +2,8 @@
 
 A full-stack RPL (IPv6 Routing Protocol for Low-Power and Lossy Networks) simulator with:
 
+- Live Demo: https://rpl-simulator-ef1e.vercel.app/
+
 - React + Vite frontend
 - FastAPI backend
 - DODAG formation
