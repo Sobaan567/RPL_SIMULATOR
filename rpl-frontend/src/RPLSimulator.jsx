@@ -172,6 +172,7 @@ export default function RPLSimulator() {
   const [stepCount,  setStepCount]  = useState(0);
   const [radioRange, setRadioRange] = useState(200);
   const [nodeCounter,setNodeCounter]= useState(12);
+  const [scenarioLog,setScenarioLog]= useState([]);
   const [chatOpen,   setChatOpen]   = useState(false);
   const [chatInput,  setChatInput]  = useState("");
   const [chatBusy,   setChatBusy]   = useState(false);
@@ -202,6 +203,7 @@ export default function RPLSimulator() {
     setPhase("idle"); setHotspots([]); setActions([]);
     setPkts([]); setRipples([]); setAnalytics(null); setEnergyReport(null); setMlStatus("idle");
     setDioCount(0); setDaoCount(0); setDataCount(0); setAckCount(0); setStepCount(0);
+    setScenarioLog([]);
     setExecLog([]); setActiveStep(null);
     stepsRef.current = []; stepIdxRef.current = 0;
     setSimRunning(false);
@@ -569,6 +571,80 @@ export default function RPLSimulator() {
     return cur?.is_root ? path : [];
   }
 
+  function getRouteNodeIds(startId, ns = nodesRef.current) {
+    const hops = getPathToRoot(startId, ns);
+    if (!hops.length) return [];
+    return [startId, ...hops.map(([, parent]) => parent)];
+  }
+
+  function logScenario(msg, color = "#f59e0b") {
+    const entry = { msg, color, time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) };
+    setScenarioLog(p => [entry, ...p].slice(0, 8));
+    setExecLog(p => [...p, { wave: p.length + 1, type: "DATA", msg }]);
+    setActiveStep(execLog.length);
+  }
+
+  function recalcAfterScenario(nextNodes) {
+    setNodes(nextNodes);
+    setTimeout(() => { detectHotspots(nextNodes); computeAnalytics(nextNodes); }, 80);
+  }
+
+  function selectedOrWeakestNode(ns = nodesRef.current) {
+    const selected = selNode ? ns.find(n => n.id === selNode.id && !n.is_root) : null;
+    if (selected) return selected;
+    return [...ns].filter(n => !n.is_root).sort((a, b) => a.energy - b.energy)[0] || null;
+  }
+
+  function drainSelectedNode() {
+    const target = selectedOrWeakestNode();
+    if (!target) return;
+    const next = nodesRef.current.map(n => n.id === target.id
+      ? { ...n, energy: Math.max(0, n.energy - 35), energy_pct: Math.max(0, n.energy_pct - 35), pulse: Date.now() }
+      : n);
+    recalcAfterScenario(next);
+    logScenario(`Failure drill: ${target.id} lost 35% battery and should be watched for parent re-election.`, "#ef4444");
+  }
+
+  function killSelectedNode() {
+    const target = selectedOrWeakestNode();
+    if (!target) return;
+    const next = nodesRef.current.map(n => {
+      if (n.id === target.id) return { ...n, energy: 0, energy_pct: 0, joined: false, parent: null, children: [], flags: ["low_energy"], pulse: Date.now() };
+      if (n.parent === target.id) return { ...n, parent: null, rank: INF, joined: false, etx: 1, pulse: Date.now() };
+      return { ...n, children: (n.children || []).filter(c => c !== target.id) };
+    });
+    recalcAfterScenario(next);
+    logScenario(`Node failure: ${target.id} was taken offline; direct children became orphaned until the next Run/Step.`, "#ef4444");
+  }
+
+  function burstTraffic() {
+    const ns = nodesRef.current;
+    const target = (selNode && ns.find(n => n.id === selNode.id && !n.is_root)) || ns.find(n => hotspots.some(h => h.node_id === n.id)) || ns.find(n => !n.is_root && n.children.length);
+    if (!target) return;
+    const next = ns.map(n => n.id === target.id
+      ? { ...n, traffic_rx: n.traffic_rx + 12, traffic_tx: n.traffic_tx + Math.max(4, n.children.length * 3), energy: Math.max(0, n.energy - 8), energy_pct: Math.max(0, n.energy_pct - 8), pulse: Date.now() }
+      : n);
+    recalcAfterScenario(next);
+    logScenario(`Traffic burst: ${target.id} received relay pressure and may become a hotspot.`, "#f59e0b");
+  }
+
+  function jamRadioRange() {
+    setRadioRange(r => Math.max(100, r - 45));
+    logScenario("Radio jamming drill: communication range was reduced. Run again to see isolated nodes.", "#f59e0b");
+  }
+
+  function randomFailure() {
+    const candidates = nodesRef.current.filter(n => !n.is_root);
+    const target = candidates[Math.floor(Math.random() * candidates.length)];
+    if (!target) return;
+    setSelNode(target);
+    const next = nodesRef.current.map(n => n.id === target.id
+      ? { ...n, energy: Math.max(0, n.energy - 35), energy_pct: Math.max(0, n.energy_pct - 35), pulse: Date.now() }
+      : n);
+    recalcAfterScenario(next);
+    logScenario(`Random failure drill selected ${target.id} and reduced its battery by 35%.`, "#ef4444");
+  }
+
   function transmitDataToBase({ includeAck = true, reason = "manual" } = {}) {
     if (dataTimerRef.current) { clearInterval(dataTimerRef.current); dataTimerRef.current = null; }
     const ns = nodesRef.current;
@@ -875,6 +951,48 @@ export default function RPLSimulator() {
       ctx.restore();
     });
 
+    if (selNode) {
+      const route = getPathToRoot(selNode.id, nodes);
+      if (route.length) {
+        const selectedIds = new Set(getRouteNodeIds(selNode.id, nodes));
+        const root = nodes.find(n => n.is_root);
+        const routeHops = root ? [...route, [root.id, BASE_STATION_ID]] : route;
+        routeHops.forEach(([fromId, toId]) => {
+          const from = fromId === BASE_STATION_ID ? baseStation : nodes.find(n => n.id === fromId);
+          const to = toId === BASE_STATION_ID ? baseStation : nodes.find(n => n.id === toId);
+          if (!from || !to) return;
+          const ang = Math.atan2(to.y - from.y, to.x - from.x);
+          const sx = from.x + Math.cos(ang) * 30;
+          const sy = from.y + Math.sin(ang) * 30;
+          const tx = to.x - Math.cos(ang) * 30;
+          const ty = to.y - Math.sin(ang) * 30;
+          ctx.save();
+          ctx.strokeStyle = "#38bdf8";
+          ctx.shadowColor = "#38bdf8";
+          ctx.shadowBlur = 16;
+          ctx.lineWidth = 5;
+          ctx.lineCap = "round";
+          ctx.setLineDash([10, 7]);
+          ctx.beginPath();
+          ctx.moveTo(sx, sy);
+          ctx.lineTo(tx, ty);
+          ctx.stroke();
+          ctx.restore();
+        });
+        nodes.filter(n => selectedIds.has(n.id)).forEach(n => {
+          ctx.save();
+          ctx.strokeStyle = "#bae6fd";
+          ctx.lineWidth = 3;
+          ctx.shadowColor = "#38bdf8";
+          ctx.shadowBlur = 14;
+          ctx.beginPath();
+          ctx.arc(n.x, n.y, n.r + 12, 0, Math.PI * 2);
+          ctx.stroke();
+          ctx.restore();
+        });
+      }
+    }
+
     pkts.forEach(p => {
       const ease = p.t < .5 ? 2 * p.t * p.t : 1 - 2 * (1 - p.t) * (1 - p.t);
       const px = p.fx + (p.tx - p.fx) * ease, py = p.fy + (p.ty - p.fy) * ease;
@@ -1123,9 +1241,9 @@ export default function RPLSimulator() {
     return map[type] || { bg: "#334155", color: "#fff", label: type };
   }
 
-  async function sendChatMessage(e) {
+  async function sendChatMessage(e, quickText = "") {
     e?.preventDefault();
-    const text = chatInput.trim();
+    const text = (quickText || chatInput).trim();
     if (!text || chatBusy) return;
 
     const nextMessages = [...chatMessages, { role: "user", text }];
@@ -1146,10 +1264,13 @@ export default function RPLSimulator() {
         parent: selNode.parent,
         energy_pct: selNode.energy_pct,
         children: selNode.children?.length || 0,
+        routeToRoot: getRouteNodeIds(selNode.id),
       } : null,
       counters: { dioCount, daoCount, dataCount, ackCount, stepCount },
       analytics,
       hotspots,
+      energyReport,
+      scenarioLog,
       mlStatus,
     };
 
@@ -1168,6 +1289,11 @@ export default function RPLSimulator() {
     } finally {
       setChatBusy(false);
     }
+  }
+
+  function explainCurrentSimulation() {
+    setChatOpen(true);
+    sendChatMessage(null, "Explain the current RPL simulation state like a demo narrator. Include DODAG status, selected node route, hotspot risk, ML energy risk, and the next best action.");
   }
 
   const palettes = {
@@ -1314,6 +1440,7 @@ export default function RPLSimulator() {
         <Btn onClick={transmitDataToBase} disabled={simRunning || !nodes.some(n=>!n.is_root&&n.joined&&n.parent)} color="#06b6d4">⇪ Send Data</Btn>
         <Btn onClick={drainEnergy} disabled={phase!=="done"||mlStatus==="running"} color={C.warn}>{mlStatus==="running"?"ML...":"⚡ Drain"}</Btn>
         <Btn onClick={resolveIssues} disabled={phase!=="done"||hotspots.length===0} color="#a855f7">🔧 Fix</Btn>
+        <Btn onClick={explainCurrentSimulation} disabled={chatBusy} color="#38bdf8">AI Explain</Btn>
         <div style={{ width:1,height:26,background:C.br }} />
         <label style={{ fontSize:10,color:C.tx3,display:"flex",alignItems:"center",gap:5 }}>OF:
           <select value={ofMode} onChange={e=>{setOfMode(e.target.value);resetDodag();}} style={selectStyle}>
@@ -1487,6 +1614,8 @@ export default function RPLSimulator() {
             <TabBtn id="inspector" label="Inspect" />
             <TabBtn id="execlog" label="Exec Log" badge={execLog.length||null} />
             <TabBtn id="analytics" label="Stats" />
+            <TabBtn id="ml" label="ML" />
+            <TabBtn id="scenario" label="Scenario" />
           </div>
 
           <div style={{ flex:1,overflow:"hidden auto" }}>
@@ -1730,6 +1859,85 @@ export default function RPLSimulator() {
                 ) : <div style={{ color:C.tx3,fontSize:11,lineHeight:2 }}>Run ▶ to generate analytics.</div>}
               </div>
             )}
+
+            {activeTab==="ml" && (
+              <div style={{ padding:12 }}>
+                <div style={{ display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12 }}>
+                  <div>
+                    <div style={{ fontSize:14,fontWeight:900,color:C.tx }}>ML Energy Model</div>
+                    <div style={{ fontSize:10,color:C.tx3,marginTop:2 }}>{mlStatus==="backend"?"Backend prediction active":mlStatus==="fallback"?"Frontend fallback active":"Run Drain to score nodes"}</div>
+                  </div>
+                  <Btn onClick={drainEnergy} disabled={phase!=="done"||mlStatus==="running"} color={C.warn}>{mlStatus==="running"?"ML...":"Score"}</Btn>
+                </div>
+                {energyReport ? (
+                  <>
+                    <div style={{ display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:7,marginBottom:12 }}>
+                      {[["Avg",energyReport.summary.avg_energy,C.ac],["Min",energyReport.summary.min_energy,C.warn],["Drain",energyReport.summary.total_predicted_drain,C.err]].map(([label,value,color])=>(
+                        <div key={label} style={{ padding:9,borderRadius:8,background:C.cardBg,border:`1px solid ${C.br}` }}>
+                          <div style={{ fontSize:8,color:C.tx3,fontWeight:800 }}>{label}</div>
+                          <div style={{ marginTop:4,fontSize:16,fontWeight:900,color }}>{value}</div>
+                        </div>
+                      ))}
+                    </div>
+                    <div style={{ display:"flex",flexDirection:"column",gap:8 }}>
+                      {[...energyReport.predictions].sort((a,b)=>b.predicted_drain-a.predicted_drain).map(p=>{
+                        const node = nodes.find(n=>n.id===p.id);
+                        const risk = p.energy_pct < 25 ? "HIGH" : p.energy_pct < 50 || p.predicted_drain > 2 ? "MED" : "LOW";
+                        const color = risk==="HIGH"?C.err:risk==="MED"?C.warn:C.ok;
+                        return (
+                          <div key={p.id} onClick={()=>{ if(node){ setSelNode(node); setActiveTab("inspector"); } }} style={{ padding:9,borderRadius:8,background:C.bg3,border:`1px solid ${C.br}`,cursor:"pointer" }}>
+                            <div style={{ display:"flex",justifyContent:"space-between",gap:8,alignItems:"center",marginBottom:7 }}>
+                              <span style={{ fontFamily:"monospace",fontSize:11,color:C.tx,fontWeight:800 }}>{p.id}</span>
+                              <span style={{ fontSize:8,padding:"2px 6px",borderRadius:5,background:color+"22",color,fontWeight:900 }}>{risk}</span>
+                            </div>
+                            <div style={{ display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:7,fontSize:9,color:C.tx3,marginBottom:7 }}>
+                              <span>Drain <b style={{ color:C.warn }}>{p.predicted_drain}</b></span>
+                              <span>Energy <b style={{ color:C.tx2 }}>{p.energy_pct}%</b></span>
+                              <span>Children <b style={{ color:C.tx2 }}>{node?.children?.length||0}</b></span>
+                            </div>
+                            <div style={{ height:5,borderRadius:3,background:C.br,overflow:"hidden" }}>
+                              <div style={{ height:"100%",width:`${p.energy_pct}%`,background:color,borderRadius:3 }} />
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </>
+                ) : (
+                  <div style={{ color:C.tx3,fontSize:11,lineHeight:1.8 }}>Drain the network to generate per-node energy predictions and risk ranking.</div>
+                )}
+              </div>
+            )}
+
+            {activeTab==="scenario" && (
+              <div style={{ padding:12 }}>
+                <div style={{ marginBottom:12 }}>
+                  <div style={{ fontSize:14,fontWeight:900,color:C.tx }}>Failure Scenarios</div>
+                  <div style={{ fontSize:10,color:C.tx3,marginTop:2 }}>Select a node first, or the simulator picks a risky node.</div>
+                </div>
+                <div style={{ display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:12 }}>
+                  <Btn onClick={drainSelectedNode} color={C.warn}>Drain Node</Btn>
+                  <Btn onClick={killSelectedNode} color={C.err}>Kill Node</Btn>
+                  <Btn onClick={burstTraffic} color="#06b6d4">Traffic Burst</Btn>
+                  <Btn onClick={jamRadioRange} color="#f97316">Jam Radio</Btn>
+                  <Btn onClick={randomFailure} color="#a855f7">Random Fault</Btn>
+                  <Btn onClick={()=>{ resetDodag(); setActiveTab("nodes"); }} color={C.tx3}>Clear Drill</Btn>
+                </div>
+                <div style={{ padding:10,borderRadius:8,background:C.cardBg,border:`1px solid ${C.br}`,marginBottom:12 }}>
+                  <div style={{ display:"flex",justifyContent:"space-between",fontSize:10,marginBottom:6 }}><span style={{ color:C.tx3 }}>Selected</span><b style={{ color:C.tx2,fontFamily:"monospace" }}>{selN?.id||"none"}</b></div>
+                  <div style={{ display:"flex",justifyContent:"space-between",fontSize:10,marginBottom:6 }}><span style={{ color:C.tx3 }}>Route hops</span><b style={{ color:C.tx2 }}>{selN ? Math.max(0,getRouteNodeIds(selN.id).length-1) : 0}</b></div>
+                  <div style={{ display:"flex",justifyContent:"space-between",fontSize:10 }}><span style={{ color:C.tx3 }}>Range</span><b style={{ color:C.tx2 }}>{radioRange}px</b></div>
+                </div>
+                <div style={{ fontSize:9,color:C.tx3,letterSpacing:".06em",fontWeight:800,marginBottom:7 }}>DRILL LOG</div>
+                <div style={{ display:"flex",flexDirection:"column",gap:7 }}>
+                  {scenarioLog.length ? scenarioLog.map((entry,i)=>(
+                    <div key={i} style={{ padding:8,borderRadius:7,background:C.bg3,border:`1px solid ${C.br}`,fontSize:10,color:C.tx3,lineHeight:1.5 }}>
+                      <span style={{ color:entry.color,fontWeight:800 }}>{entry.time}</span> {entry.msg}
+                    </div>
+                  )) : <div style={{ color:C.tx3,fontSize:11,lineHeight:1.8 }}>Run a failure scenario to watch routing, energy, and hotspot behavior change.</div>}
+                </div>
+              </div>
+            )}
           </div>
         </div>
       </div>
@@ -1742,8 +1950,12 @@ export default function RPLSimulator() {
                 <div style={{ fontSize:12,fontWeight:900,color:C.tx,lineHeight:1.2 }}>Gemini Network Chat</div>
                 <div style={{ fontSize:9,color:C.tx3,fontWeight:700,letterSpacing:".05em",textTransform:"uppercase" }}>Gemini 2.5 Flash</div>
               </div>
-              <button type="button" onClick={() => setChatOpen(false)} title="Close chat"
-                style={{ width:30,height:30,borderRadius:7,border:`1px solid ${C.br}`,background:C.controlBg,color:C.tx2,cursor:"pointer",fontSize:16,lineHeight:1 }}>x</button>
+              <div style={{ display:"flex",gap:6,alignItems:"center" }}>
+                <button type="button" onClick={() => { setChatError(""); setChatMessages([{ role: "assistant", text: "Hi, I am your Gemini RPL assistant. Ask me about the network, energy, hotspots, or what to click next." }]); }} title="Clear chat"
+                  style={{ height:30,padding:"0 9px",borderRadius:7,border:`1px solid ${C.br}`,background:C.controlBg,color:C.tx3,cursor:"pointer",fontSize:10,fontWeight:800 }}>Clear</button>
+                <button type="button" onClick={() => setChatOpen(false)} title="Close chat"
+                  style={{ width:30,height:30,borderRadius:7,border:`1px solid ${C.br}`,background:C.controlBg,color:C.tx2,cursor:"pointer",fontSize:16,lineHeight:1 }}>x</button>
+              </div>
             </div>
 
             <div style={{ flex:1,overflow:"auto",padding:12,display:"flex",flexDirection:"column",gap:9,background:"rgba(0,0,0,.08)" }}>
@@ -1767,6 +1979,20 @@ export default function RPLSimulator() {
                 {chatError}
               </div>
             )}
+
+            <div style={{ padding:"9px 10px 0",display:"grid",gridTemplateColumns:"1fr 1fr",gap:7,background:C.topBg }}>
+              {[
+                ["Explain Network", "Explain the current RPL network state, including DODAG formation, hotspots, and energy risk."],
+                ["Selected Node", selNode ? `Explain selected node ${selNode.id}, its route, rank, parent, energy, and risks.` : "Tell me which node to select and why."],
+                ["Suggest Fix", "Suggest the best repair actions for the current simulation issues."],
+                ["ML Risk", "Explain the ML energy prediction and highest-risk nodes in this simulation."],
+              ].map(([label, prompt]) => (
+                <button key={label} type="button" disabled={chatBusy} onClick={e => sendChatMessage(e, prompt)}
+                  style={{ minHeight:30,borderRadius:7,border:`1px solid ${C.br}`,background:C.controlBg,color:C.tx2,cursor:chatBusy?"not-allowed":"pointer",fontSize:10,fontWeight:800,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap" }}>
+                  {label}
+                </button>
+              ))}
+            </div>
 
             <form onSubmit={sendChatMessage} style={{ padding:10,borderTop:`1px solid ${C.br}`,display:"grid",gridTemplateColumns:"1fr auto",gap:8,background:C.topBg }}>
               <textarea
