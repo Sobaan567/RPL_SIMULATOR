@@ -12,6 +12,10 @@ A full-stack RPL (IPv6 Routing Protocol for Low-Power and Lossy Networks) simula
 - Hotspot detection and repair
 - ML-style backend energy prediction
 - Manual node insertion with rank, Base Station distance, and energy inputs
+- Floating Gemini 2.5 Flash network assistant
+- Selected-node route highlighting
+- Failure and attack scenario controls
+- Dedicated ML risk ranking panel
 
 The simulator is designed to show how IoT sensor nodes join an RPL DODAG, forward traffic toward a root, send data to a Base Station, receive acknowledgements, lose energy, become hotspots, and recover through parent re-election.
 
@@ -174,6 +178,71 @@ This means:
 - lower energy increases cost
 - the child rank can never be less than `parent rank + 1`
 
+### 11. Gemini Network Assistant
+
+The floating `AI` button opens a Gemini 2.5 Flash chat assistant. It can explain the current simulation, selected node, hotspot risk, ML energy prediction, and repair options.
+
+The assistant receives simulator context such as:
+
+- current phase
+- selected node and route
+- DIO / DAO / DATA / ACK counters
+- analytics
+- hotspot list
+- ML energy report
+- recent failure scenario log
+
+The top bar also includes `AI Explain`, which sends a one-click prompt asking Gemini to narrate the current network state and recommend the next action.
+
+Production Vercel deployments use the serverless endpoint:
+
+```text
+/api/chat/gemini
+```
+
+Local development uses the FastAPI endpoint:
+
+```text
+http://127.0.0.1:8000/chat/gemini
+```
+
+### 12. Route Highlighting
+
+Click any joined sensor node to highlight its route:
+
+```text
+selected node -> parent chain -> DODAG root -> Base Station
+```
+
+The highlighted path helps show how RPL forwards application traffic through the DODAG before reaching the Base Station.
+
+### 13. Failure And Attack Scenarios
+
+The `Scenario` tab adds interactive stress tests:
+
+- `Drain Node`: reduce the selected or weakest node battery
+- `Kill Node`: take a selected or weak node offline and orphan direct children
+- `Traffic Burst`: increase relay pressure to create hotspot behavior
+- `Jam Radio`: reduce radio range to simulate degraded connectivity
+- `Random Fault`: pick a random non-root node and drain it
+- `Clear Drill`: reset the DODAG state
+
+Scenario events are shown in a drill log and are also appended to the execution log.
+
+### 14. ML Risk Panel
+
+The `ML` tab ranks every node after `Drain` using predicted energy drain and remaining battery.
+
+For each node it shows:
+
+- risk level
+- predicted drain
+- remaining energy
+- children count
+- energy bar
+
+Clicking a node in the ML ranking selects it for inspection and route highlighting.
+
 ## Frontend Controls
 
 Top bar:
@@ -184,6 +253,7 @@ Top bar:
 - `Send Data`: animate DATA to Base Station and ACK replies
 - `Drain`: call backend ML energy calculation and animate DATA/ACK traffic
 - `Fix`: attempt hotspot resolution
+- `AI Explain`: ask Gemini to explain the current simulation state
 - `OF`: switch between hop count and ETX objective modes
 - `Rng`: radio range
 - `Spd`: animation speed
@@ -207,6 +277,17 @@ Right panel:
 - `Inspect`: selected node details
 - `Exec Log`: DIO/DAO/DATA/DRAIN/FIX events
 - `Stats`: analytics, ML energy report, resolution log
+- `ML`: per-node predicted drain and energy risk ranking
+- `Scenario`: failure, traffic burst, and radio jamming drills
+
+Floating assistant:
+
+- `AI`: opens Gemini Network Chat
+- `Explain Network`: summarize current DODAG, energy, and hotspot state
+- `Selected Node`: explain the selected node and route
+- `Suggest Fix`: recommend repair actions
+- `ML Risk`: explain the energy prediction and risky nodes
+- `Clear`: reset the chat transcript
 
 ## Backend Code Explanation: `backend/main.py`
 
@@ -252,6 +333,8 @@ Pydantic models define incoming JSON shapes:
 - `ResolveRequest`: session id for hotspot repair
 - `EnergyNodeIn`: node features for ML energy prediction
 - `EnergyPredictionRequest`: ML energy prediction request
+- `ChatMessageIn`: Gemini chat message input
+- `GeminiChatRequest`: Gemini chat request with simulator context
 
 ### `RPLNode`
 
@@ -373,6 +456,17 @@ It returns predicted drain and remaining energy for each node.
 
 The route `/ml/predict_energy_drain` runs this prediction for all nodes sent by the frontend.
 
+### Gemini Chat
+
+The FastAPI route `/chat/gemini` sends simulator-aware chat requests to Gemini 2.5 Flash. The backend reads:
+
+```text
+GEMINI_API_KEY
+GEMINI_MODEL
+```
+
+from environment variables or `backend/.env`.
+
 ## API Endpoints
 
 | Method | Endpoint | Purpose |
@@ -387,6 +481,7 @@ The route `/ml/predict_energy_drain` runs this prediction for all nodes sent by 
 | `POST` | `/simulate/resolve` | Resolve hotspots |
 | `POST` | `/simulate/drain_energy/{session_id}` | Backend session drain simulation |
 | `POST` | `/ml/predict_energy_drain` | ML-style per-node energy prediction |
+| `POST` | `/chat/gemini` | Gemini network assistant chat |
 | `DELETE` | `/simulate/{session_id}` | Delete session |
 | `GET` | `/sessions` | List active sessions |
 
@@ -456,10 +551,14 @@ http://127.0.0.1:5173
 6. Click `Send Data`.
 7. Watch DATA go to the Base Station and ACK return.
 8. Click `Drain`.
-9. Open `Stats` and inspect `ML ENERGY`.
-10. Watch the heatmap and ML Risk Radar.
-11. Click `Fix` if hotspots appear.
-12. Try manual insertion using the `M` toolbar button.
+9. Open `ML` and inspect the ranked node risk list.
+10. Click a node to highlight its route to the root and Base Station.
+11. Open `Stats` and inspect `ML ENERGY`.
+12. Watch the heatmap and ML Risk Radar.
+13. Open `Scenario` and try `Traffic Burst`, `Drain Node`, or `Jam Radio`.
+14. Click `Fix` if hotspots appear.
+15. Click `AI Explain` or open the floating `AI` chat for a Gemini explanation.
+16. Try manual insertion using the `M` toolbar button.
 
 ## Build Check
 
