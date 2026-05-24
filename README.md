@@ -411,6 +411,13 @@ $env:GEMINI_API_KEY="your-gemini-api-key"
 python -m uvicorn main:app --reload --host 127.0.0.1 --port 8000
 ```
 
+On Vercel, add these Environment Variables to the frontend project:
+
+```text
+GEMINI_API_KEY=your-gemini-api-key
+GEMINI_MODEL=gemini-2.5-flash
+```
+
 Backend URL:
 
 ```text
