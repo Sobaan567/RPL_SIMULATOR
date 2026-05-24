@@ -19,6 +19,28 @@ A full-stack RPL (IPv6 Routing Protocol for Low-Power and Lossy Networks) simula
 
 The simulator is designed to show how IoT sensor nodes join an RPL DODAG, forward traffic toward a root, send data to a Base Station, receive acknowledgements, lose energy, become hotspots, and recover through parent re-election.
 
+## Algorithm Guide: What Each Algorithm Does
+
+This project combines several routing, energy, and repair algorithms. Each one is responsible for a different part of the simulation.
+
+| Algorithm / Logic | What It Does | Where You See It |
+|---|---|---|
+| `DODAG Formation` | Builds the RPL routing tree from the root node. The root sends DIO messages, nearby nodes join, choose parents, receive ranks, and then help spread DIO messages further. | Click `Run` or `Step`; blue DIO packets appear and nodes connect into a tree. |
+| `OF0 - Hop Count` | Chooses routes mainly by the number of hops to the root. A node prefers the parent that gives it the lowest hop-based rank. | Use the `OF` control and select hop mode. |
+| `MRHOF - ETX` | Chooses routes using link quality. Longer or weaker links get higher ETX cost, so nodes prefer more reliable paths instead of only the shortest hop count. | Use the `OF` control and select ETX mode; enable ETX labels to inspect link cost. |
+| `Rank Calculation` | Calculates how far a node is from the root in routing cost. Lower rank means a better position in the DODAG. | Node table, node labels, selected-node inspector, and execution log. |
+| `Preferred Parent Selection` | Decides which neighbor should become a node's parent. A node changes parent only when the new parent gives a better rank. | During DIO formation when lines appear between child and parent nodes. |
+| `DAO Registration` | Sends route registration messages upward from joined nodes to their parents. This confirms upward routes back toward the root. | After DODAG formation; orange DAO packets travel child to parent. |
+| `DATA Forwarding` | Sends application traffic from sensor nodes through their parent chain to the DODAG root, then to the Base Station. | Click `Send Data`; cyan DATA packets travel toward the Base Station. |
+| `ACK Return Path` | Sends acknowledgement packets back from the Base Station through the root and parent chain to the original sensor node. | Purple ACK packets return after DATA traffic. |
+| `Energy Drain Model` | Reduces node battery based on sending, receiving, idle cost, relay load, and traffic pressure. Relay nodes with many children lose more energy. | Energy rings around nodes, battery values in the node table, and Stats tab. |
+| `ML-Style Energy Prediction` | Predicts how much energy each node will lose using features such as children count, RX packets, TX packets, root role, DATA packets, and ACK packets. | Click `Drain`; results appear in `Stats` and the `ML` tab. |
+| `Hotspot Detection` | Finds nodes that are overloaded or low on energy. A node is risky when it forwards too much traffic or its battery becomes critical. | Warning node colors, issue banner, hotspot count, ML risk list, and heatmap. |
+| `Hotspot Resolution / Repair` | Tries to move children away from overloaded or low-energy relay nodes. It searches for alternate parents in range, avoids loops, and recalculates rank and ETX. | Click `Fix`; repair actions appear in the execution log and Stats tab. |
+| `Manual Node Insertion Logic` | Allows a manually inserted node to use custom rank, Base Station distance, and energy values when calculating its routing cost. | Use the `M` toolbar mode, enter values, then insert a node. |
+| `Failure Scenario Logic` | Simulates network problems such as drained nodes, killed nodes, traffic bursts, radio jamming, and random faults. | Open the `Scenario` tab and run a drill. |
+| `Route Highlighting` | Traces the selected node's path through its parents to the root and then to the Base Station. | Click any joined sensor node. |
+
 ## Project Structure
 
 ```text
