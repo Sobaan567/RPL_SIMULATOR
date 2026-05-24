@@ -13,7 +13,23 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional
-import math, random, time, uuid
+import json, math, os, random, time, urllib.error, urllib.request, uuid
+
+def load_env_file(path=".env"):
+    if not os.path.exists(path):
+        return
+    with open(path, "r", encoding="utf-8") as env_file:
+        for raw_line in env_file:
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+load_env_file()
 
 app = FastAPI(title="RPL Simulator API", version="3.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -62,6 +78,14 @@ class EnergyPredictionRequest(BaseModel):
     cycles: int = 1
     data_packets: int = 1
     ack_packets: int = 1
+
+class ChatMessageIn(BaseModel):
+    role: str
+    text: str
+
+class GeminiChatRequest(BaseModel):
+    messages: list[ChatMessageIn]
+    simulator_context: Optional[dict] = None
 
 # ─────────────────────────── SESSION STORE ───────────────────────────
 sessions: dict = {}
@@ -610,6 +634,61 @@ def predict_energy_drain(body: EnergyPredictionRequest):
             "node_count": len(predictions),
         },
     }
+
+@app.post("/chat/gemini")
+def chat_with_gemini(body: GeminiChatRequest):
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        raise HTTPException(500, "GEMINI_API_KEY is not set on the backend")
+
+    model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
+    context = body.simulator_context or {}
+    history = body.messages[-12:]
+
+    system_text = (
+        "You are a helpful assistant inside an RPL network simulator. "
+        "Answer clearly and concisely. When useful, relate answers to DODAG formation, "
+        "DIO, DAO, DATA, ACK, rank, ETX, energy drain, hotspots, and repair. "
+        f"Current simulator context JSON: {json.dumps(context, ensure_ascii=True)[:3000]}"
+    )
+
+    contents = [{"role": "user", "parts": [{"text": system_text}]}]
+    for msg in history:
+        role = "model" if msg.role == "assistant" else "user"
+        text = msg.text.strip()
+        if text:
+            contents.append({"role": role, "parts": [{"text": text[:4000]}]})
+
+    payload = {
+        "contents": contents,
+        "generationConfig": {
+            "temperature": 0.7,
+            "maxOutputTokens": 700,
+        },
+    }
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise HTTPException(exc.code, f"Gemini API error: {detail[:600]}")
+    except Exception as exc:
+        raise HTTPException(502, f"Could not reach Gemini API: {exc}")
+
+    candidates = data.get("candidates") or []
+    parts = candidates[0].get("content", {}).get("parts", []) if candidates else []
+    reply = "".join(part.get("text", "") for part in parts).strip()
+    if not reply:
+        reply = "Gemini returned an empty response. Try asking again."
+    return {"reply": reply, "model": model}
 
 @app.delete("/simulate/{session_id}")
 def delete_session(session_id: str):

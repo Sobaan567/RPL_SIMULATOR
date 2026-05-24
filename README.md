@@ -404,6 +404,13 @@ pip install -r requirements.txt
 uvicorn main:app --reload --host 127.0.0.1 --port 8000
 ```
 
+For the floating Gemini chat bot, set your API key before starting the backend:
+
+```powershell
+$env:GEMINI_API_KEY="your-gemini-api-key"
+python -m uvicorn main:app --reload --host 127.0.0.1 --port 8000
+```
+
 Backend URL:
 
 ```text

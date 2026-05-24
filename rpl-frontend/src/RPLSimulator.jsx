@@ -171,6 +171,13 @@ export default function RPLSimulator() {
   const [stepCount,  setStepCount]  = useState(0);
   const [radioRange, setRadioRange] = useState(200);
   const [nodeCounter,setNodeCounter]= useState(12);
+  const [chatOpen,   setChatOpen]   = useState(false);
+  const [chatInput,  setChatInput]  = useState("");
+  const [chatBusy,   setChatBusy]   = useState(false);
+  const [chatError,  setChatError]  = useState("");
+  const [chatMessages,setChatMessages]= useState([
+    { role: "assistant", text: "Hi, I am your Gemini RPL assistant. Ask me about the network, energy, hotspots, or what to click next." },
+  ]);
   // Execution log
   const [execLog,    setExecLog]    = useState([]);   // array of wave objects
   const [activeStep, setActiveStep] = useState(null); // highlighted step index
@@ -1115,6 +1122,53 @@ export default function RPLSimulator() {
     return map[type] || { bg: "#334155", color: "#fff", label: type };
   }
 
+  async function sendChatMessage(e) {
+    e?.preventDefault();
+    const text = chatInput.trim();
+    if (!text || chatBusy) return;
+
+    const nextMessages = [...chatMessages, { role: "user", text }];
+    setChatMessages(nextMessages);
+    setChatInput("");
+    setChatBusy(true);
+    setChatError("");
+
+    const context = {
+      phase,
+      objectiveFunction: ofMode,
+      radioRange,
+      nodeCount: nodes.length,
+      joinedNodes: nodes.filter(n => n.joined || n.is_root).length,
+      selectedNode: selNode ? {
+        id: selNode.id,
+        rank: selNode.rank,
+        parent: selNode.parent,
+        energy_pct: selNode.energy_pct,
+        children: selNode.children?.length || 0,
+      } : null,
+      counters: { dioCount, daoCount, dataCount, ackCount, stepCount },
+      analytics,
+      hotspots,
+      mlStatus,
+    };
+
+    try {
+      const res = await fetch(`${API_BASE}/chat/gemini`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ messages: nextMessages, simulator_context: context }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || "Gemini chat failed");
+      setChatMessages([...nextMessages, { role: "assistant", text: data.reply || "No reply received." }]);
+    } catch (err) {
+      setChatError(err.message || "Could not contact Gemini.");
+      setChatMessages([...nextMessages, { role: "assistant", text: "I could not reach Gemini yet. Make sure the backend has GEMINI_API_KEY set, then try again." }]);
+    } finally {
+      setChatBusy(false);
+    }
+  }
+
   const palettes = {
     dark: {
       bg: "#040914", bg2: "#081425", bg3: "#10213b", bg4: "#0d1a30",
@@ -1677,6 +1731,68 @@ export default function RPLSimulator() {
             )}
           </div>
         </div>
+      </div>
+
+      <div style={{ position:"fixed",right:18,bottom:18,zIndex:80,display:"flex",flexDirection:"column",alignItems:"flex-end",gap:10,pointerEvents:"none" }}>
+        {chatOpen && (
+          <div style={{ width:"min(380px, calc(100vw - 36px))",height:"min(560px, calc(100vh - 108px))",background:C.panelBg,border:`1px solid ${C.br2}`,borderRadius:8,boxShadow:"0 22px 70px rgba(0,0,0,.36)",display:"flex",flexDirection:"column",overflow:"hidden",pointerEvents:"auto" }}>
+            <div style={{ padding:"12px 13px",borderBottom:`1px solid ${C.br}`,display:"flex",alignItems:"center",justifyContent:"space-between",gap:10,background:C.topBg }}>
+              <div style={{ minWidth:0 }}>
+                <div style={{ fontSize:12,fontWeight:900,color:C.tx,lineHeight:1.2 }}>Gemini Network Chat</div>
+                <div style={{ fontSize:9,color:C.tx3,fontWeight:700,letterSpacing:".05em",textTransform:"uppercase" }}>Gemini 2.5 Flash</div>
+              </div>
+              <button type="button" onClick={() => setChatOpen(false)} title="Close chat"
+                style={{ width:30,height:30,borderRadius:7,border:`1px solid ${C.br}`,background:C.controlBg,color:C.tx2,cursor:"pointer",fontSize:16,lineHeight:1 }}>x</button>
+            </div>
+
+            <div style={{ flex:1,overflow:"auto",padding:12,display:"flex",flexDirection:"column",gap:9,background:"rgba(0,0,0,.08)" }}>
+              {chatMessages.map((msg, idx) => {
+                const mine = msg.role === "user";
+                return (
+                  <div key={idx} style={{ alignSelf:mine?"flex-end":"flex-start",maxWidth:"86%",padding:"9px 10px",borderRadius:8,border:`1px solid ${mine ? C.ac+"66" : C.br}`,background:mine ? `linear-gradient(180deg,${C.ac}33,${C.ac}18)` : C.cardBg,color:C.tx2,fontSize:11,lineHeight:1.55,textAlign:"left",whiteSpace:"pre-wrap",overflowWrap:"anywhere" }}>
+                    {msg.text}
+                  </div>
+                );
+              })}
+              {chatBusy && (
+                <div style={{ alignSelf:"flex-start",padding:"9px 10px",borderRadius:8,border:`1px solid ${C.br}`,background:C.cardBg,color:C.tx3,fontSize:11 }}>
+                  Thinking...
+                </div>
+              )}
+            </div>
+
+            {chatError && (
+              <div style={{ padding:"7px 12px",borderTop:`1px solid ${C.br}`,color:C.warn,fontSize:10,textAlign:"left",background:C.bg3 }}>
+                {chatError}
+              </div>
+            )}
+
+            <form onSubmit={sendChatMessage} style={{ padding:10,borderTop:`1px solid ${C.br}`,display:"grid",gridTemplateColumns:"1fr auto",gap:8,background:C.topBg }}>
+              <textarea
+                value={chatInput}
+                onChange={e => setChatInput(e.target.value)}
+                onKeyDown={e => {
+                  if (e.key === "Enter" && !e.shiftKey) {
+                    e.preventDefault();
+                    sendChatMessage(e);
+                  }
+                }}
+                placeholder="Ask Gemini about this RPL network..."
+                rows={2}
+                style={{ resize:"none",minHeight:42,maxHeight:90,borderRadius:8,border:`1px solid ${C.br}`,background:C.controlBg,color:C.tx,fontSize:11,lineHeight:1.35,padding:"9px 10px",outline:"none",fontFamily:"inherit",letterSpacing:0 }}
+              />
+              <button type="submit" disabled={chatBusy || !chatInput.trim()}
+                style={{ width:54,borderRadius:8,border:`1px solid ${chatBusy || !chatInput.trim() ? C.br : C.ac+"88"}`,background:chatBusy || !chatInput.trim() ? C.disabledBg : `linear-gradient(180deg,${C.ac}33,${C.ac}18)`,color:chatBusy || !chatInput.trim() ? C.tx3 : C.ac,fontSize:11,fontWeight:900,cursor:chatBusy || !chatInput.trim() ? "not-allowed" : "pointer" }}>
+                Send
+              </button>
+            </form>
+          </div>
+        )}
+
+        <button type="button" onClick={() => setChatOpen(open => !open)} title="Open Gemini chat"
+          style={{ width:58,height:58,borderRadius:29,border:`1px solid ${C.ac+"88"}`,background:"linear-gradient(135deg,#06b6d4,#2563eb 48%,#7c3aed)",color:"#fff",boxShadow:"0 16px 42px rgba(37,99,235,.34)",fontSize:20,fontWeight:950,cursor:"pointer",pointerEvents:"auto" }}>
+          AI
+        </button>
       </div>
     </div>
   );
