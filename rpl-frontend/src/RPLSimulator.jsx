@@ -1601,7 +1601,9 @@ export default function RPLSimulator() {
             })()}
           </svg>
 
-          
+          <div style={{ position:"absolute",bottom:12,left:"50%",transform:"translateX(-50%)",background:C.panelBg,border:`1px solid ${C.br}`,borderRadius:8,padding:"7px 16px",color:C.tx2,fontSize:12,fontWeight:800,boxShadow:C.subtleShadow,pointerEvents:"none",zIndex:5 }}>
+            Made By Syed Sobaan Najmi 😉
+          </div>
 
         </div>
 
