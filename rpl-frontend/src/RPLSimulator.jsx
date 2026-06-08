@@ -30,7 +30,7 @@ import {
 const BATTERY_CAP = 100;
 const INF = 9999;
 const BASE_STATION_ID = "__base_station__";
-const DODAG_REPAIR_MIN_RANGE = 330;
+const DODAG_REPAIR_MIN_RANGE = 250;
 const API_BASE = import.meta.env.VITE_API_BASE || "http://127.0.0.1:8000";
 const CHAT_ENDPOINT = import.meta.env.VITE_CHAT_ENDPOINT || (import.meta.env.PROD ? "/api/chat/gemini" : `${API_BASE}/chat/gemini`);
 function dist(a, b) { return Math.hypot(a.x - b.x, a.y - b.y); }
