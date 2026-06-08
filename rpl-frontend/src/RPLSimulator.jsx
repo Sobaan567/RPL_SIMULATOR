@@ -1873,7 +1873,6 @@ export default function RPLSimulator() {
       overlayBgStrong: "linear-gradient(180deg,rgba(9,28,42,.96),rgba(6,14,24,.88))",
       manualBg: "linear-gradient(180deg,rgba(34,22,56,.96),rgba(7,17,29,.9))",
       minimapBg: "rgba(6,16,24,0.82)",
-      creditBg: "linear-gradient(180deg,rgba(9,28,42,.72),rgba(6,14,24,.62))",
       rowAlt: "rgba(16,34,54,.55)",
       rowBorder: "rgba(125,211,252,.08)",
       disabledBg: "rgba(20,35,48,.32)",
@@ -1906,7 +1905,6 @@ export default function RPLSimulator() {
       overlayBgStrong: "linear-gradient(180deg,rgba(255,255,255,.95),rgba(232,244,251,.9))",
       manualBg: "linear-gradient(180deg,rgba(252,250,255,.96),rgba(241,236,252,.9))",
       minimapBg: "rgba(250,253,255,0.92)",
-      creditBg: "linear-gradient(180deg,rgba(255,255,255,.78),rgba(235,245,252,.72))",
       rowAlt: "#eef6fb",
       rowBorder: "#d7e5f1",
       disabledBg: "rgba(202,218,232,.35)",
@@ -2209,10 +2207,6 @@ export default function RPLSimulator() {
               </>;
             })()}
           </svg>
-
-          <div style={{ position:"absolute",bottom:12,left:"50%",transform:"translateX(-50%)",background:C.creditBg,border:`1px solid ${C.br}`,borderRadius:999,padding:"7px 16px",color:C.tx2,fontSize:11,fontWeight:800,boxShadow:C.subtleShadow,pointerEvents:"none",zIndex:5,backdropFilter:"blur(12px)" }}>
-            Made By Syed Sobaan Najmi
-          </div>
 
         </div>
 
