@@ -1,8 +1,36 @@
 import { useState, useEffect, useRef } from "react";
+import {
+  Activity,
+  BarChart3,
+  Bot,
+  Download,
+  Flame,
+  Gauge,
+  Info,
+  Layers,
+  LocateFixed,
+  Map as MapIcon,
+  Menu,
+  MousePointer2,
+  Play,
+  Plus,
+  Radar,
+  Radio,
+  RotateCcw,
+  Send,
+  Settings2,
+  Sparkles,
+  StepForward,
+  Tag,
+  Trash2,
+  Wrench,
+  Zap,
+} from "lucide-react";
 
 const BATTERY_CAP = 100;
 const INF = 9999;
 const BASE_STATION_ID = "__base_station__";
+const DODAG_REPAIR_MIN_RANGE = 330;
 const API_BASE = import.meta.env.VITE_API_BASE || "http://127.0.0.1:8000";
 const CHAT_ENDPOINT = import.meta.env.VITE_CHAT_ENDPOINT || (import.meta.env.PROD ? "/api/chat/gemini" : `${API_BASE}/chat/gemini`);
 function dist(a, b) { return Math.hypot(a.x - b.x, a.y - b.y); }
@@ -180,6 +208,12 @@ export default function RPLSimulator() {
   const [chatMessages,setChatMessages]= useState([
     { role: "assistant", text: "Hi, I am your Gemini RPL assistant. Ask me about the network, energy, hotspots, or what to click next." },
   ]);
+  const [guideOpen,  setGuideOpen]  = useState(false);
+  const [guideStep,  setGuideStep]  = useState(0);
+  const [guideRunning,setGuideRunning]= useState(false);
+  const [panelOpen,  setPanelOpen]  = useState(true);
+  const [isCompact,  setIsCompact]  = useState(false);
+  const [comparison, setComparison] = useState(null);
   // Execution log
   const [execLog,    setExecLog]    = useState([]);   // array of wave objects
   const [activeStep, setActiveStep] = useState(null); // highlighted step index
@@ -187,6 +221,16 @@ export default function RPLSimulator() {
 
   useEffect(() => { nodesRef.current = nodes; }, [nodes]);
   useEffect(() => { baseStationRef.current = baseStation; }, [baseStation]);
+  useEffect(() => {
+    const syncViewport = () => {
+      const compact = window.innerWidth < 980;
+      setIsCompact(compact);
+      setPanelOpen(open => compact ? false : open);
+    };
+    syncViewport();
+    window.addEventListener("resize", syncViewport);
+    return () => window.removeEventListener("resize", syncViewport);
+  }, []);
 
   function addEvt(entries) {
     // entries can be string or {msg,lvl}
@@ -205,6 +249,7 @@ export default function RPLSimulator() {
     setDioCount(0); setDaoCount(0); setDataCount(0); setAckCount(0); setStepCount(0);
     setScenarioLog([]);
     setExecLog([]); setActiveStep(null);
+    setGuideRunning(false); setGuideStep(0);
     stepsRef.current = []; stepIdxRef.current = 0;
     setSimRunning(false);
     if (animTimerRef.current) { clearInterval(animTimerRef.current); animTimerRef.current = null; }
@@ -217,34 +262,128 @@ export default function RPLSimulator() {
     return baseStationRef.current || baseStation || getBaseStationPos(W, H);
   }
 
+  function isDeadNode(n) {
+    return !n?.is_root && (n.dead || n.energy <= 0 || n.energy_pct <= 0);
+  }
+
+  function normalizeDeadNodes(ns) {
+    const deadIds = new Set(ns.filter(isDeadNode).map(n => n.id));
+    return ns.map(n => {
+      const dead = deadIds.has(n.id);
+      const parentGone = n.parent && deadIds.has(n.parent);
+      return {
+        ...n,
+        dead,
+        energy: dead ? 0 : n.energy,
+        energy_pct: dead ? 0 : n.energy_pct,
+        rank: dead ? INF : n.rank,
+        parent: dead || parentGone ? null : n.parent,
+        children: dead ? [] : (n.children || []).filter(c => !deadIds.has(c)),
+        joined: dead ? false : n.joined,
+        flags: dead ? [...new Set([...(n.flags || []), "dead"])] : (n.flags || []).filter(f => f !== "dead"),
+      };
+    });
+  }
+
+  function rebuildDodagPreservingEnergy(ns, range = radioRange) {
+    const copy = normalizeDeadNodes(ns).map(n => ({
+      ...n,
+      rank: isDeadNode(n) ? INF : n.is_root ? 0 : INF,
+      parent: null,
+      children: [],
+      joined: !isDeadNode(n) && n.is_root,
+      etx: isDeadNode(n) ? 1 : n.etx,
+      pulse: isDeadNode(n) ? Date.now() : n.pulse,
+    }));
+    const liveNodes = copy.filter(n => !isDeadNode(n));
+    const rebuildRank = (s, r) => {
+      if (ofMode === "hop") return s.rank + 1;
+      const d = dist(s, r) / range;
+      return +(s.rank + 1 + 2.4 * d * d).toFixed(2);
+    };
+
+    for (let pass = 0; pass < liveNodes.length; pass += 1) {
+      let changed = false;
+      liveNodes.filter(s => s.rank !== INF).forEach(s => {
+        liveNodes.filter(o => o.id !== s.id && !o.is_root && dist(s, o) < range).forEach(nb => {
+          const nr = rebuildRank(s, nb);
+          if (nr < nb.rank) {
+            nb.rank = nr;
+            nb.parent = s.id;
+            nb.joined = true;
+            nb.etx = calcETX(s, nb, range);
+            nb.pulse = Date.now();
+            changed = true;
+          }
+        });
+      });
+      if (!changed) break;
+    }
+
+    copy.forEach(n => { n.children = []; });
+    copy.forEach(n => {
+      if (!n.parent || isDeadNode(n)) return;
+      const parent = copy.find(p => p.id === n.parent && !isDeadNode(p));
+      if (parent && !parent.children.includes(n.id)) parent.children.push(n.id);
+    });
+    return copy;
+  }
+
+  function applyDeadNodeRebuild(ns, reason = "battery depleted") {
+    const normalized = normalizeDeadNodes(ns);
+    const deadIds = normalized.filter(isDeadNode).map(n => n.id);
+    if (!deadIds.length) return { nodes: normalized, deadIds };
+    const repairRange = Math.max(radioRange, DODAG_REPAIR_MIN_RANGE);
+    setRadioRange(repairRange);
+    const rebuilt = rebuildDodagPreservingEnergy(normalized, repairRange);
+    setPhase("done");
+    stepsRef.current = [];
+    stepIdxRef.current = 0;
+    setSimRunning(false);
+    if (selNode && deadIds.includes(selNode.id)) setSelNode(null);
+    setExecLog(p => [...p, {
+      wave: p.length + 1,
+      type: "FIX",
+      msg: `Node ${deadIds.join(", ")} is dead (${reason}). DODAG was rebuilt using remaining node battery levels.`,
+    }]);
+    setActiveStep(execLog.length);
+    setScenarioLog(p => [{
+      msg: `Dead node removed from routing: ${deadIds.join(", ")}. DODAG rebuilt with current batteries.`,
+      color: "#ef4444",
+      time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+    }, ...p].slice(0, 8));
+    return { nodes: rebuilt, deadIds };
+  }
+
   function resetDodag() {
     if (animTimerRef.current) { clearInterval(animTimerRef.current); animTimerRef.current = null; }
-    setNodes(p => p.map(n => ({ ...n, rank: n.is_root ? 0 : INF, parent: null, children: [], joined: n.is_root, flags: [], traffic_rx: 0, traffic_tx: 0, etx: 1, pulse: 0 })));
+    setNodes(p => normalizeDeadNodes(p).map(n => ({ ...n, rank: n.is_root && !isDeadNode(n) ? 0 : INF, parent: null, children: [], joined: n.is_root && !isDeadNode(n), flags: isDeadNode(n) ? ["dead"] : [], traffic_rx: 0, traffic_tx: 0, etx: 1, pulse: 0 })));
     resetStats();
   }
 
-  function calcRank(s, r) {
+  function calcRank(s, r, range = radioRange) {
     if (r.manual) {
       const distanceCost = r.manual.baseDistance / 120;
       const energyPenalty = Math.max(0, 100 - r.manual.energy) / 35;
       return +Math.max(s.rank + 1, r.manual.rank + distanceCost + energyPenalty).toFixed(2);
     }
     if (ofMode === "hop") return s.rank + 1;
-    const d = dist(s, r) / radioRange;
+    const d = dist(s, r) / range;
     return +(s.rank + 1 + 2.4 * d * d).toFixed(2);
   }
-  function calcETX(s, r) {
-    const d = dist(s, r) / radioRange;
+  function calcETX(s, r, range = radioRange) {
+    const d = dist(s, r) / range;
     return +(1 + 2.4 * d * d).toFixed(2);
   }
 
-  function buildSteps(ns) {
-    const roots = ns.filter(n => n.is_root);
+  function buildSteps(ns, range = radioRange) {
+    const liveNodes = ns.filter(n => !isDeadNode(n));
+    const roots = liveNodes.filter(n => n.is_root);
     const visited = new Set(roots.map(r => r.id));
     const q = [...roots], steps = [];
     while (q.length) {
       const s = q.shift();
-      ns.filter(o => o.id !== s.id && dist(s, o) < radioRange).forEach(nb => {
+      liveNodes.filter(o => o.id !== s.id && dist(s, o) < range).forEach(nb => {
         steps.push({ from: s.id, to: nb.id });
         if (!visited.has(nb.id)) { visited.add(nb.id); q.push(nb); }
       });
@@ -252,17 +391,17 @@ export default function RPLSimulator() {
     return steps;
   }
 
-  function execStep(steps, ns) {
+  function execStep(steps, ns, range = radioRange) {
     if (stepIdxRef.current >= steps.length) return null;
     const { from, to } = steps[stepIdxRef.current++];
     const s = ns.find(n => n.id === from), r = ns.find(n => n.id === to);
-    if (!s || !r) return { from, to, improved: false };
-    const nr = calcRank(s, r);
+    if (!s || !r || isDeadNode(s) || isDeadNode(r)) return { from, to, improved: false };
+    const nr = calcRank(s, r, range);
     const improved = nr < r.rank;
     if (improved) {
       if (r.parent) { const op = ns.find(n => n.id === r.parent); if (op) op.children = op.children.filter(c => c !== r.id); }
       r.rank = nr; r.parent = s.id; r.joined = true; r.pulse = Date.now();
-      r.etx = calcETX(s, r);
+      r.etx = calcETX(s, r, range);
       if (!s.children.includes(r.id)) s.children.push(r.id);
       s.energy = Math.max(0, s.energy - 0.06); r.energy = Math.max(0, r.energy - 0.025);
       s.energy_pct = +s.energy.toFixed(1); r.energy_pct = +r.energy.toFixed(1);
@@ -305,6 +444,67 @@ export default function RPLSimulator() {
 
   function animate() {
     if (simRunning) return;
+    if (nodesRef.current.some(isDeadNode)) {
+      resetStats();
+      const repairRange = Math.max(radioRange, DODAG_REPAIR_MIN_RANGE);
+      setRadioRange(repairRange);
+      const ns = normalizeDeadNodes(nodesRef.current).map(n => ({
+        ...n,
+        rank: isDeadNode(n) ? INF : n.is_root ? 0 : INF,
+        parent: null,
+        children: [],
+        joined: !isDeadNode(n) && n.is_root,
+        traffic_rx: 0,
+        traffic_tx: 0,
+        etx: 1,
+        pulse: 0,
+      }));
+      const steps = buildSteps(ns, repairRange);
+      stepsRef.current = steps;
+      stepIdxRef.current = 0;
+      setNodes(ns);
+      setPhase("building");
+      setSimRunning(true);
+      setExecLog(generateExecLog(ns));
+      setActiveStep(0);
+      const delay = Math.max(55, 280 - speed * 24);
+      animTimerRef.current = setInterval(() => {
+        if (stepIdxRef.current >= steps.length) {
+          clearInterval(animTimerRef.current); animTimerRef.current = null;
+          setSimRunning(false); setPhase("done");
+          setTimeout(() => {
+            ns.forEach((n, i) => {
+              if (n.parent && !isDeadNode(n)) {
+                setTimeout(() => { spawnPkt(n.id, n.parent, "#f59e0b", "DAO"); setDaoCount(c => c + 1); }, i * 85);
+              }
+            });
+            computeAnalytics(ns); detectHotspots(ns);
+            setActiveStep(prev => prev !== null ? Math.max(prev, 1) : 1);
+          }, 300);
+          return;
+        }
+        const result = execStep(stepsRef.current, ns, repairRange);
+        if (result?.improved) {
+          spawnPkt(result.from, result.to, "#3b82f6", "DIO");
+          const rn = ns.find(n => n.id === result.to);
+          if (rn) spawnRipple(rn.x, rn.y, "#22c55e");
+        } else if (result) {
+          spawnPkt(result.from, result.to, "#1e3a5f", "DIO");
+        }
+        setNodes([...ns]);
+        setDioCount(c => c + 1); setStepCount(c => c + 1);
+      }, delay);
+      setExecLog([{
+        wave: 1,
+        type: "DIO",
+        msg: "Dead node ignored. Root sends DIO again; live nodes select parents by rank through valid neighbors.",
+      }, {
+        wave: 2,
+        type: "DAO",
+        msg: "Joined nodes return DAO upward to their selected parents.",
+      }, { wave: 3, type: "DONE" }]);
+      return;
+    }
     resetDodag();
     setTimeout(() => {
       const ns = nodesRef.current.map(n => ({ ...n }));
@@ -352,6 +552,63 @@ export default function RPLSimulator() {
   }
 
   function stepOne() {
+    if (nodesRef.current.some(isDeadNode)) {
+      const repairRange = Math.max(radioRange, DODAG_REPAIR_MIN_RANGE);
+      if (phase !== "building" || !stepsRef.current.length) {
+        setRadioRange(repairRange);
+        const seed = normalizeDeadNodes(nodesRef.current).map(n => ({
+          ...n,
+          rank: isDeadNode(n) ? INF : n.is_root ? 0 : INF,
+          parent: null,
+          children: [],
+          joined: !isDeadNode(n) && n.is_root,
+          traffic_rx: 0,
+          traffic_tx: 0,
+          etx: 1,
+          pulse: 0,
+        }));
+        stepsRef.current = buildSteps(seed, repairRange);
+        stepIdxRef.current = 0;
+        setNodes(seed);
+        setPhase("building");
+        setExecLog([{
+          wave: 1,
+          type: "DIO",
+          msg: "Dead node ignored. DIO repair started through live neighbors.",
+        }, {
+          wave: 2,
+          type: "DAO",
+          msg: "DAO returns upward after parent selection.",
+        }, { wave: 3, type: "DONE" }]);
+        setActiveStep(0);
+        return;
+      }
+      const ns = nodesRef.current.map(n => ({ ...n, children: [...(n.children || [])] }));
+      if (stepIdxRef.current >= stepsRef.current.length) {
+        setPhase("done");
+        ns.forEach((n, i) => {
+          if (n.parent && !isDeadNode(n)) {
+            setTimeout(() => { spawnPkt(n.id, n.parent, "#f59e0b", "DAO"); setDaoCount(c => c + 1); }, i * 70);
+          }
+        });
+        computeAnalytics(ns);
+        detectHotspots(ns);
+        setActiveStep(2);
+        return;
+      }
+      const result = execStep(stepsRef.current, ns, repairRange);
+      if (result?.improved) {
+        spawnPkt(result.from, result.to, "#3b82f6", "DIO");
+        const rn = ns.find(n => n.id === result.to);
+        if (rn) spawnRipple(rn.x, rn.y, "#22c55e");
+      } else if (result) {
+        spawnPkt(result.from, result.to, "#1e3a5f", "DIO");
+      }
+      setNodes([...ns]);
+      setDioCount(c => c + 1); setStepCount(c => c + 1);
+      setActiveStep(0);
+      return;
+    }
     if (phase === "idle") {
       const ns = nodesRef.current.map(n => ({ ...n }));
       stepsRef.current = buildSteps(ns); stepIdxRef.current = 0;
@@ -377,27 +634,40 @@ export default function RPLSimulator() {
     setActiveStep(prev => Math.min((prev || 0) + 1, execLog.length - 1));
   }
 
-  function computeAnalytics(ns) {
-    const total = ns.length, joined = ns.filter(n => n.joined || n.is_root).length;
-    const energies = ns.map(n => n.energy);
+  function isRelayHotspot(n, includeTrafficPressure = false) {
+    if (!includeTrafficPressure || n.is_root || isDeadNode(n)) return false;
+    const childCount = n.children?.length || 0;
+    const t = n.traffic_rx + n.traffic_tx;
+    const relayLoad = childCount >= 2 || n.traffic_tx >= 4;
+    const forwardingPressure = childCount >= 2 && (t >= childCount + 1 || n.energy < 96);
+    const trafficSkew = t >= 4 && n.traffic_rx / Math.max(1, t) > 0.5;
+    return relayLoad && (forwardingPressure || trafficSkew);
+  }
+
+  function computeAnalytics(ns, opts = {}) {
+    const includeTrafficPressure = opts.includeTrafficPressure || false;
+    const liveNodes = ns.filter(n => !isDeadNode(n));
+    const total = liveNodes.length || 1, joined = liveNodes.filter(n => n.joined || n.is_root).length;
+    const energies = liveNodes.map(n => n.energy);
     const avgE = energies.reduce((a, b) => a + b, 0) / energies.length;
-    const ranked = ns.filter(n => n.rank !== INF).map(n => n.rank);
+    const ranked = liveNodes.filter(n => n.rank !== INF).map(n => n.rank);
     const avgR = ranked.length ? ranked.reduce((a, b) => a + b, 0) / ranked.length : 0;
-    const hs = ns.filter(n => { const t = n.traffic_rx + n.traffic_tx; return !n.is_root && t > 0 && n.traffic_rx / t > 0.6; });
-    const crit = ns.filter(n => n.energy < 15 && !n.is_root);
+    const hs = ns.filter(n => isRelayHotspot(n, includeTrafficPressure));
+    const crit = ns.filter(n => n.energy < 15 && !n.is_root && !isDeadNode(n));
     const health = Math.round((joined / total * 40) + (avgE / BATTERY_CAP * 35) + Math.max(0, 25 - hs.length * 8));
     setAnalytics({ joined, total, joinPct: +(joined / total * 100).toFixed(1), avgEnergy: +avgE.toFixed(1), minEnergy: +Math.min(...energies).toFixed(1), hotspotCount: hs.length, criticalCount: crit.length, avgRank: +avgR.toFixed(2), maxRank: ranked.length ? Math.max(...ranked) : 0, health });
   }
 
-  function detectHotspots(ns) {
+  function detectHotspots(ns, opts = {}) {
+    const includeTrafficPressure = opts.includeTrafficPressure || false;
     const hs = ns.filter(n => {
-      const t = n.traffic_rx + n.traffic_tx;
-      return !n.is_root && ((t > 0 && n.traffic_rx / t > 0.6) || n.energy < 15);
+      const overloadedRelay = isRelayHotspot(n, includeTrafficPressure);
+      return !isDeadNode(n) && !n.is_root && (overloadedRelay || n.energy < 15);
     }).map(n => ({
       node_id: n.id,
       flags: [
-        ...((t => t > 0 && n.traffic_rx / t > 0.6 ? ["hotspot"] : [])(n.traffic_rx + n.traffic_tx)),
-        ...(n.energy < 15 && !n.is_root ? ["low_energy"] : []),
+        ...(isRelayHotspot(n, includeTrafficPressure) ? ["hotspot"] : []),
+        ...(n.energy < 15 && !n.is_root && !isDeadNode(n) ? ["low_energy"] : []),
       ],
       traffic_rx: n.traffic_rx, energy_pct: +n.energy.toFixed(1), children: n.children.length,
     }));
@@ -431,6 +701,7 @@ export default function RPLSimulator() {
         collectDesc(child.id);
 
         const candidates = copy.filter(o =>
+          !isDeadNode(o) &&
           o.id !== node.id &&
           o.id !== child.id &&
           !descendants.has(o.id) &&
@@ -464,7 +735,7 @@ export default function RPLSimulator() {
 
     setNodes(copy);
     setActions(acts);
-    setTimeout(() => { computeAnalytics(copy); detectHotspots(copy); }, 50);
+    setTimeout(() => { computeAnalytics(copy, { includeTrafficPressure: true }); detectHotspots(copy, { includeTrafficPressure: true }); }, 50);
     // Append resolution steps to exec log
     const resEntry = {
       wave: execLog.length + 1, type: "FIX",
@@ -476,7 +747,18 @@ export default function RPLSimulator() {
 
   function localEnergyPrediction(ns) {
     const predictions = ns.map(n => {
-      const predictedDrain = +((n.children.length * 0.42) + (n.traffic_rx * 0.018) + (n.traffic_tx * 0.024) + (n.is_root ? 0.35 : 0) + 0.16).toFixed(3);
+      if (isDeadNode(n)) {
+        return {
+          id: n.id,
+          previous_energy: 0,
+          predicted_drain: 0,
+          predicted_energy: 0,
+          energy_pct: 0,
+          model: "frontend_ml_fallback",
+        };
+      }
+      const relayPressure = Math.max(0, n.children.length - 1) * 1.15;
+      const predictedDrain = +Math.min(18, (n.children.length * 1.15) + relayPressure + (n.traffic_rx * 0.16) + (n.traffic_tx * 0.2) + (n.is_root ? 0.85 : 0) + 0.55).toFixed(3);
       const predictedEnergy = +Math.max(0, n.energy - predictedDrain).toFixed(3);
       return {
         id: n.id,
@@ -499,20 +781,51 @@ export default function RPLSimulator() {
     };
   }
 
+  function buildDrainTrafficLoad(ns) {
+    const load = {};
+    ns.forEach(n => { load[n.id] = { rx: 0, tx: 0 }; });
+    const sources = ns.filter(n => !isDeadNode(n) && !n.is_root && n.joined && n.parent);
+    const leaves = sources.filter(n => !ns.some(o => !isDeadNode(o) && o.parent === n.id));
+    const senders = (leaves.length ? leaves : sources).slice(0, 8);
+    senders.forEach(sender => {
+      const route = getPathToRoot(sender.id, ns);
+      route.forEach(([from, to]) => {
+        if (load[from]) load[from].tx += 1;
+        if (load[to]) load[to].rx += 1;
+        if (load[to]) load[to].tx += 0.5;
+      });
+      [...route].reverse().forEach(([from, to]) => {
+        if (load[to]) load[to].tx += 0.5;
+        if (load[from]) load[from].rx += 0.5;
+      });
+    });
+    return load;
+  }
+
   async function drainEnergy() {
     const current = nodesRef.current;
+    setActiveTab("ml");
+    const trafficLoad = buildDrainTrafficLoad(current);
+    const pressuredNodes = current.map(n => ({
+      ...n,
+      traffic_rx: n.traffic_rx + (trafficLoad[n.id]?.rx || 0),
+      traffic_tx: n.traffic_tx + (trafficLoad[n.id]?.tx || 0),
+    }));
     setMlStatus("running");
     let report;
 
     try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 1200);
       const res = await fetch(`${API_BASE}/ml/predict_energy_drain`, {
         method: "POST",
+        signal: controller.signal,
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           cycles: 1,
           data_packets: 1,
           ack_packets: 1,
-          nodes: current.map(n => ({
+          nodes: pressuredNodes.map(n => ({
             id: n.id,
             is_root: n.is_root,
             energy: n.energy,
@@ -523,36 +836,65 @@ export default function RPLSimulator() {
           })),
         }),
       });
+      clearTimeout(timeout);
       if (!res.ok) throw new Error(`ML backend returned ${res.status}`);
       report = await res.json();
       setMlStatus("backend");
     } catch (err) {
-      report = localEnergyPrediction(current);
+      report = localEnergyPrediction(pressuredNodes);
       setMlStatus("fallback");
     }
 
-    const byId = new Map(report.predictions.map(p => [p.id, p]));
-    const nextNodes = current.map(n => {
+    const fallbackReport = localEnergyPrediction(pressuredNodes);
+    const fallbackById = new globalThis.Map(fallbackReport.predictions.map(p => [p.id, p]));
+    const rawPredictions = Array.isArray(report.predictions) && report.predictions.length ? report.predictions : fallbackReport.predictions;
+    const predictions = rawPredictions.map(p => {
+      const fallback = fallbackById.get(p.id);
+      if (!fallback) return p;
+      const predictedDrain = Math.max(Number(p.predicted_drain) || 0, fallback.predicted_drain);
+      const predictedEnergy = +Math.max(0, (fallback.previous_energy ?? 100) - predictedDrain).toFixed(3);
+      return {
+        ...p,
+        previous_energy: fallback.previous_energy,
+        predicted_drain: +predictedDrain.toFixed(3),
+        predicted_energy: predictedEnergy,
+        energy_pct: +(predictedEnergy / BATTERY_CAP * 100).toFixed(1),
+      };
+    });
+    report = {
+      ...fallbackReport,
+      ...report,
+      predictions,
+      summary: {
+        avg_energy: predictions.length ? +(predictions.reduce((a, p) => a + p.predicted_energy, 0) / predictions.length).toFixed(2) : 0,
+        min_energy: predictions.length ? +Math.min(...predictions.map(p => p.predicted_energy)).toFixed(2) : 0,
+        total_predicted_drain: +predictions.reduce((a, p) => a + p.predicted_drain, 0).toFixed(2),
+        node_count: predictions.length,
+      },
+    };
+
+    const byId = new globalThis.Map(report.predictions.map(p => [p.id, p]));
+    const nextNodes = pressuredNodes.map(n => {
       const p = byId.get(n.id);
       if (!p) return n;
       return {
         ...n,
         energy: p.predicted_energy,
         energy_pct: p.energy_pct,
-        traffic_rx: n.traffic_rx + n.children.length,
-        traffic_tx: n.traffic_tx + (n.is_root ? 0 : 1),
         pulse: Date.now(),
       };
     });
 
-    setNodes(nextNodes);
+    const { nodes: routedNodes, deadIds } = applyDeadNodeRebuild(nextNodes, "battery depleted during drain");
+
+    setNodes(routedNodes);
     setEnergyReport(report);
-    setTimeout(() => { detectHotspots(nextNodes); computeAnalytics(nextNodes); }, 80);
+    setTimeout(() => { detectHotspots(routedNodes, { includeTrafficPressure: true }); computeAnalytics(routedNodes, { includeTrafficPressure: true }); }, 80);
     const source = report.model === "frontend_ml_fallback" ? "frontend fallback" : "backend ML model";
     const drainEntry = {
       wave: execLog.length + 1,
       type: "DRAIN",
-      msg: `ML energy calculation completed by ${source}: ${report.summary.node_count} nodes, total predicted drain ${report.summary.total_predicted_drain}.`,
+      msg: `ML energy calculation completed by ${source}: ${report.summary.node_count} nodes, total predicted drain ${report.summary.total_predicted_drain}.${deadIds.length ? ` Dead nodes removed: ${deadIds.join(", ")}.` : ""}`,
     };
     setExecLog(p => [...p, drainEntry]);
     setActiveStep(execLog.length);
@@ -563,7 +905,7 @@ export default function RPLSimulator() {
     const path = [];
     const seen = new Set();
     let cur = ns.find(n => n.id === startId);
-    while (cur && !cur.is_root && cur.parent && !seen.has(cur.id)) {
+    while (cur && !isDeadNode(cur) && !cur.is_root && cur.parent && !seen.has(cur.id)) {
       seen.add(cur.id);
       path.push([cur.id, cur.parent]);
       cur = ns.find(n => n.id === cur.parent);
@@ -585,14 +927,15 @@ export default function RPLSimulator() {
   }
 
   function recalcAfterScenario(nextNodes) {
-    setNodes(nextNodes);
-    setTimeout(() => { detectHotspots(nextNodes); computeAnalytics(nextNodes); }, 80);
+    const { nodes: routedNodes } = applyDeadNodeRebuild(nextNodes, "battery depleted during scenario");
+    setNodes(routedNodes);
+    setTimeout(() => { detectHotspots(routedNodes, { includeTrafficPressure: true }); computeAnalytics(routedNodes, { includeTrafficPressure: true }); }, 80);
   }
 
   function selectedOrWeakestNode(ns = nodesRef.current) {
-    const selected = selNode ? ns.find(n => n.id === selNode.id && !n.is_root) : null;
+    const selected = selNode ? ns.find(n => n.id === selNode.id && !n.is_root && !isDeadNode(n)) : null;
     if (selected) return selected;
-    return [...ns].filter(n => !n.is_root).sort((a, b) => a.energy - b.energy)[0] || null;
+    return [...ns].filter(n => !n.is_root && !isDeadNode(n)).sort((a, b) => a.energy - b.energy)[0] || null;
   }
 
   function drainSelectedNode() {
@@ -609,7 +952,7 @@ export default function RPLSimulator() {
     const target = selectedOrWeakestNode();
     if (!target) return;
     const next = nodesRef.current.map(n => {
-      if (n.id === target.id) return { ...n, energy: 0, energy_pct: 0, joined: false, parent: null, children: [], flags: ["low_energy"], pulse: Date.now() };
+      if (n.id === target.id) return { ...n, dead: true, energy: 0, energy_pct: 0, joined: false, parent: null, children: [], flags: ["dead", "low_energy"], pulse: Date.now() };
       if (n.parent === target.id) return { ...n, parent: null, rank: INF, joined: false, etx: 1, pulse: Date.now() };
       return { ...n, children: (n.children || []).filter(c => c !== target.id) };
     });
@@ -648,8 +991,8 @@ export default function RPLSimulator() {
   function transmitDataToBase({ includeAck = true, reason = "manual" } = {}) {
     if (dataTimerRef.current) { clearInterval(dataTimerRef.current); dataTimerRef.current = null; }
     const ns = nodesRef.current;
-    const sources = ns.filter(n => !n.is_root && n.joined && n.parent);
-    const leaves = sources.filter(n => !ns.some(o => o.parent === n.id));
+    const sources = ns.filter(n => !isDeadNode(n) && !n.is_root && n.joined && n.parent);
+    const leaves = sources.filter(n => !ns.some(o => !isDeadNode(o) && o.parent === n.id));
     const senders = (leaves.length ? leaves : sources).slice(0, 6);
     const root = ns.find(n => n.is_root);
     const routes = senders.map(n => {
@@ -740,6 +1083,163 @@ export default function RPLSimulator() {
     setNodeCounter(c => c + 1);
   }
 
+  function applyPreset(kind) {
+    const cv = cvRef.current;
+    const rect = cv?.getBoundingClientRect();
+    const W = rect?.width || cv?.offsetWidth || 900;
+    const H = rect?.height || cv?.offsetHeight || 600;
+    const cx = W / 2;
+    let rows;
+
+    if (kind === "healthy") rows = DEFAULT_NODES(W, H);
+    else if (kind === "dense") rows = [
+      { id: "0x0001", x: cx, y: 72, is_root: true },
+      ...Array.from({ length: 18 }, (_, i) => {
+        const ring = i < 6 ? 145 : i < 12 ? 255 : 365;
+        const angle = -Math.PI / 2 + (i % 6) * (Math.PI * 2 / 6) + (i >= 6 ? 0.22 : 0);
+        return { id: `0x${(i + 2).toString(16).toUpperCase().padStart(4, "0")}`, x: Math.max(50, Math.min(W - 55, cx + Math.cos(angle) * ring)), y: Math.max(55, Math.min(H - 55, 250 + Math.sin(angle) * ring * .62)) };
+      }),
+    ];
+    else if (kind === "sparse") rows = [
+      { id: "0x0001", x: cx, y: 80, is_root: true },
+      { id: "0x0002", x: cx - 230, y: 210 },
+      { id: "0x0003", x: cx + 220, y: 215 },
+      { id: "0x0004", x: cx - 330, y: 390 },
+      { id: "0x0005", x: cx - 40, y: 390 },
+      { id: "0x0006", x: cx + 330, y: 390 },
+      { id: "0x0007", x: cx + 80, y: 525 },
+    ];
+    else if (kind === "low") rows = DEFAULT_NODES(W, H).map((n, i) => ({ ...n, energy: i === 0 ? 100 : Math.max(18, 58 - i * 3) }));
+    else rows = [
+      { id: "0x0001", x: cx, y: 75, is_root: true },
+      { id: "0x0002", x: cx - 80, y: 205 },
+      { id: "0x0003", x: cx + 80, y: 205 },
+      { id: "0x0004", x: cx - 120, y: 335 },
+      { id: "0x0005", x: cx - 60, y: 440 },
+      { id: "0x0006", x: cx + 30, y: 440 },
+      { id: "0x0007", x: cx + 115, y: 335 },
+      { id: "0x0008", x: cx + 190, y: 465 },
+      { id: "0x0009", x: cx - 210, y: 465 },
+    ];
+
+    const next = rows.map(r => makeNode(r.id, r.x, r.y, r.is_root || false, { energy: r.energy ?? BATTERY_CAP }));
+    setNodes(next);
+    setNodeCounter(next.length + 1);
+    resetStats();
+    setScenarioLog([{ msg: `Preset loaded: ${kind}. Run the DODAG to inspect routing behavior.`, color: "#38bdf8", time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) }]);
+    setActiveTab("nodes");
+  }
+
+  function simulateFormation(modeName) {
+    const copy = nodesRef.current.map(n => ({ ...n, children: [] }));
+    const roots = copy.filter(n => n.is_root);
+    const q = [...roots];
+    const visited = new Set(roots.map(r => r.id));
+    let messages = 0;
+    const rankFor = (s, r) => {
+      if (r.manual) {
+        const distanceCost = r.manual.baseDistance / 120;
+        const energyPenalty = Math.max(0, 100 - r.manual.energy) / 35;
+        return +Math.max(s.rank + 1, r.manual.rank + distanceCost + energyPenalty).toFixed(2);
+      }
+      if (modeName === "hop") return s.rank + 1;
+      const d = dist(s, r) / radioRange;
+      return +(s.rank + 1 + 2.4 * d * d).toFixed(2);
+    };
+
+    while (q.length) {
+      const s = q.shift();
+      copy.filter(o => o.id !== s.id && dist(s, o) < radioRange).forEach(nb => {
+        messages += 1;
+        const nr = rankFor(s, nb);
+        if (nr < nb.rank) {
+          if (nb.parent) {
+            const oldParent = copy.find(n => n.id === nb.parent);
+            if (oldParent) oldParent.children = oldParent.children.filter(c => c !== nb.id);
+          }
+          nb.parent = s.id;
+          nb.rank = nr;
+          nb.joined = true;
+          if (!s.children.includes(nb.id)) s.children.push(nb.id);
+        }
+        if (!visited.has(nb.id)) {
+          visited.add(nb.id);
+          q.push(nb);
+        }
+      });
+    }
+
+    const joined = copy.filter(n => n.joined || n.is_root).length;
+    const ranked = copy.filter(n => n.rank !== INF).map(n => n.rank);
+    const relays = copy.filter(n => n.children.length).length;
+    const maxChildren = Math.max(0, ...copy.map(n => n.children.length));
+    return {
+      mode: modeName === "hop" ? "OF0 Hop" : "MRHOF ETX",
+      joined,
+      links: copy.filter(n => n.parent).length,
+      avgRank: ranked.length ? +(ranked.reduce((a, b) => a + b, 0) / ranked.length).toFixed(2) : 0,
+      maxRank: ranked.length ? Math.max(...ranked) : 0,
+      messages,
+      relays,
+      maxChildren,
+    };
+  }
+
+  function compareModes() {
+    const result = { hop: simulateFormation("hop"), etx: simulateFormation("etx") };
+    setComparison(result);
+    setActiveTab("lab");
+  }
+
+  function exportReport() {
+    const report = {
+      generated_at: new Date().toISOString(),
+      phase,
+      objective_function: ofMode,
+      radio_range: radioRange,
+      counters: { dioCount, daoCount, dataCount, ackCount, stepCount },
+      analytics,
+      hotspots,
+      energy_report: energyReport,
+      scenario_log: scenarioLog,
+      comparison,
+      nodes: nodesRef.current.map(n => ({
+        id: n.id,
+        is_root: n.is_root,
+        rank: n.rank === INF ? null : n.rank,
+        parent: n.parent,
+        children: n.children,
+        energy_pct: n.energy_pct,
+        traffic_rx: n.traffic_rx,
+        traffic_tx: n.traffic_tx,
+        joined: n.joined || n.is_root,
+      })),
+    };
+    const blob = new Blob([JSON.stringify(report, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `rpl-report-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  function runGuidedDemo() {
+    if (guideRunning) return;
+    setGuideOpen(true);
+    setGuideRunning(true);
+    setGuideStep(0);
+    setActiveTab("execlog");
+    resetDodag();
+    setTimeout(() => { setGuideStep(1); animate(); }, 250);
+    setTimeout(() => { setGuideStep(2); transmitDataToBase(); }, 3600);
+    setTimeout(() => { setGuideStep(3); drainEnergy(); setActiveTab("ml"); }, 5200);
+    setTimeout(() => { setGuideStep(4); resolveIssues(); setActiveTab("analytics"); }, 7600);
+    setTimeout(() => { setGuideStep(5); compareModes(); setGuideRunning(false); }, 9000);
+  }
+
   // ── CANVAS DRAW ──
   useEffect(() => {
     const cv = cvRef.current; if (!cv) return;
@@ -754,9 +1254,32 @@ export default function RPLSimulator() {
     ctx.fillStyle = C.canvasFill; ctx.fillRect(0, 0, W, H);
     const nowMs = Date.now();
 
+    ctx.save();
+    const bg = ctx.createLinearGradient(0, 0, W, H);
+    bg.addColorStop(0, theme === "soft" ? "rgba(255,255,255,.62)" : "rgba(8,22,34,.44)");
+    bg.addColorStop(0.58, theme === "soft" ? "rgba(231,242,250,.55)" : "rgba(7,18,29,.26)");
+    bg.addColorStop(1, theme === "soft" ? "rgba(238,246,251,.64)" : "rgba(4,10,18,.36)");
+    ctx.fillStyle = bg;
+    ctx.fillRect(0, 0, W, H);
+
+    const quietGlow = ctx.createRadialGradient(W * .5, H * .28, 0, W * .5, H * .28, Math.max(W, H) * .64);
+    quietGlow.addColorStop(0, theme === "soft" ? "rgba(56,189,248,.10)" : "rgba(56,189,248,.08)");
+    quietGlow.addColorStop(1, "rgba(56,189,248,0)");
+    ctx.fillStyle = quietGlow;
+    ctx.fillRect(0, 0, W, H);
+    ctx.restore();
+
+    ctx.save();
     ctx.strokeStyle = C.gridLine; ctx.lineWidth = 0.5;
-    for (let x = 0; x < W; x += 40) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke(); }
-    for (let y = 0; y < H; y += 40) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke(); }
+    for (let x = 0; x < W; x += 40) {
+      ctx.globalAlpha = x % 120 === 0 ? .48 : .25;
+      ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, H); ctx.stroke();
+    }
+    for (let y = 0; y < H; y += 40) {
+      ctx.globalAlpha = y % 120 === 0 ? .48 : .25;
+      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+    }
+    ctx.restore();
 
     ripples.forEach(rp => {
       ctx.save(); ctx.globalAlpha = (1 - rp.t) * 0.55;
@@ -926,8 +1449,8 @@ export default function RPLSimulator() {
     ctx.restore();
 
     nodes.forEach(n => {
-      if (!n.parent) return;
-      const par = nodes.find(x => x.id === n.parent); if (!par) return;
+      if (!n.parent || isDeadNode(n)) return;
+      const par = nodes.find(x => x.id === n.parent); if (!par || isDeadNode(par)) return;
       const ang = Math.atan2(par.y - n.y, par.x - n.x);
       const sx = n.x + Math.cos(ang) * (n.r + 2), sy = n.y + Math.sin(ang) * (n.r + 2);
       const tx = par.x - Math.cos(ang) * (par.r + 3), ty = par.y - Math.sin(ang) * (par.r + 3);
@@ -936,8 +1459,17 @@ export default function RPLSimulator() {
       const cx = (sx + tx) / 2 + Math.sin(ang) * 18;
       const cy = (sy + ty) / 2 - Math.cos(ang) * 18;
       ctx.save(); ctx.setLineDash([]);
-      ctx.shadowColor = lc; ctx.shadowBlur = 7; ctx.lineWidth = 2.2; ctx.strokeStyle = lc;
+      ctx.shadowColor = lc; ctx.shadowBlur = 8; ctx.lineWidth = 2.2; ctx.strokeStyle = lc + "dd";
       ctx.beginPath(); ctx.moveTo(sx, sy); ctx.quadraticCurveTo(cx, cy, tx, ty); ctx.stroke();
+      const flow = ((nowMs / 900) + n.id.charCodeAt(n.id.length - 1) * .07) % 1;
+      const qx = (1 - flow) * (1 - flow) * sx + 2 * (1 - flow) * flow * cx + flow * flow * tx;
+      const qy = (1 - flow) * (1 - flow) * sy + 2 * (1 - flow) * flow * cy + flow * flow * ty;
+      ctx.shadowColor = lc;
+      ctx.shadowBlur = 8;
+      ctx.fillStyle = lc;
+      ctx.beginPath();
+      ctx.arc(qx, qy, 2.4, 0, Math.PI * 2);
+      ctx.fill();
       const ax = tx - Math.cos(ang) * 3, ay = ty - Math.sin(ang) * 3;
       ctx.beginPath(); ctx.moveTo(ax, ay);
       ctx.lineTo(ax - Math.cos(ang - .42) * 9, ay - Math.sin(ang - .42) * 9);
@@ -1003,13 +1535,14 @@ export default function RPLSimulator() {
       trail.addColorStop(0, p.color + "00");
       trail.addColorStop(1, p.color + "aa");
       ctx.strokeStyle = trail;
+      ctx.shadowColor = p.color;
+      ctx.shadowBlur = 10;
       ctx.lineWidth = 4;
       ctx.lineCap = "round";
       ctx.beginPath();
       ctx.moveTo(px - Math.cos(ang) * 34, py - Math.sin(ang) * 34);
       ctx.lineTo(px, py);
       ctx.stroke();
-      ctx.shadowColor = p.color; ctx.shadowBlur = 12;
       ctx.beginPath(); ctx.arc(px, py, 6, 0, Math.PI * 2); ctx.fillStyle = p.color; ctx.fill();
       ctx.shadowBlur = 0;
       ctx.font = "bold 7px sans-serif"; ctx.fillStyle = "#fff";
@@ -1022,9 +1555,10 @@ export default function RPLSimulator() {
       const nr = n.r;
       const isHs = hotspots.some(h => h.node_id === n.id && h.flags?.includes("hotspot"));
       const isCrit = hotspots.some(h => h.node_id === n.id && h.flags?.includes("low_energy"));
+      const isDead = isDeadNode(n);
       const isSel = selNode?.id === n.id, isHov = hovNode?.id === n.id && !isSel;
       const pAge = (now - (n.pulse || 0)) / 650;
-      let col = n.is_root ? "#ef4444" : n.joined ? "#22c55e" : "#334155";
+      let col = isDead ? "#475569" : n.is_root ? "#ef4444" : n.joined ? "#22c55e" : "#334155";
       if (isHs) col = "#f59e0b"; if (isCrit) col = "#ef4444";
 
       ctx.save();
@@ -1042,10 +1576,20 @@ export default function RPLSimulator() {
       ctx.fill();
       ctx.restore();
       ctx.shadowColor = col;
-      ctx.shadowBlur = isSel ? 22 : isHov ? 14 : (n.joined || n.is_root) ? 8 : 3;
-      if (!n.is_root) {
+      ctx.shadowBlur = isSel ? 20 : isHov ? 13 : (n.joined || n.is_root) ? 7 : 3;
+      ctx.save();
+      const aura = ctx.createRadialGradient(n.x, n.y, nr * .4, n.x, n.y, nr + (isSel || isHov ? 42 : 28));
+      aura.addColorStop(0, col + (isSel || isHov ? "22" : "12"));
+      aura.addColorStop(.54, col + "08");
+      aura.addColorStop(1, col + "00");
+      ctx.fillStyle = aura;
+      ctx.beginPath();
+      ctx.arc(n.x, n.y, nr + (isSel || isHov ? 42 : 28), 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+      if (!n.is_root && !isDead) {
         const ep = n.energy_pct / BATTERY_CAP;
-        ctx.beginPath(); ctx.arc(n.x, n.y, nr + 5, -Math.PI / 2, -Math.PI / 2 + ep * Math.PI * 2);
+        ctx.beginPath(); ctx.arc(n.x, n.y, nr + 6, -Math.PI / 2, -Math.PI / 2 + ep * Math.PI * 2);
         ctx.strokeStyle = ep > 0.5 ? "#22c55e" : ep > 0.25 ? "#f59e0b" : "#ef4444";
         ctx.lineWidth = 3; ctx.setLineDash([]); ctx.shadowBlur = 0; ctx.stroke();
       }
@@ -1054,22 +1598,30 @@ export default function RPLSimulator() {
         ctx.strokeStyle = "#60a5fa"; ctx.lineWidth = 2; ctx.setLineDash([4, 3]); ctx.stroke(); ctx.setLineDash([]);
       }
       const g = ctx.createRadialGradient(n.x - nr * .3, n.y - nr * .3, 2, n.x, n.y, nr);
-      if (isHs)        { g.addColorStop(0, "#fcd34d"); g.addColorStop(1, "#d97706"); }
+      if (isDead)      { g.addColorStop(0, "#64748b"); g.addColorStop(1, "#1f2937"); }
+      else if (isHs)   { g.addColorStop(0, "#fcd34d"); g.addColorStop(1, "#d97706"); }
       else if (isCrit) { g.addColorStop(0, "#f87171"); g.addColorStop(1, "#dc2626"); }
       else if (n.is_root) { g.addColorStop(0, "#ff6b6b"); g.addColorStop(1, "#dc2626"); }
       else if (n.joined)  { g.addColorStop(0, "#4ade80"); g.addColorStop(1, "#15803d"); }
       else { g.addColorStop(0, "#475569"); g.addColorStop(1, "#1e293b"); }
       ctx.beginPath(); ctx.arc(n.x, n.y, nr, 0, Math.PI * 2);
       ctx.fillStyle = g; ctx.fill();
-      ctx.strokeStyle = isSel ? "#60a5fa" : col + "cc"; ctx.lineWidth = 1.5; ctx.setLineDash([]); ctx.stroke();
+      ctx.strokeStyle = isSel ? "#bae6fd" : col + "dd"; ctx.lineWidth = 1.6; ctx.setLineDash([]); ctx.stroke();
+      ctx.save();
+      ctx.globalAlpha = .38;
+      ctx.fillStyle = "#fff";
+      ctx.beginPath();
+      ctx.ellipse(n.x - nr * .28, n.y - nr * .34, nr * .34, nr * .18, -0.5, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
       ctx.shadowBlur = 0;
       ctx.font = n.is_root ? "700 13px system-ui, sans-serif" : "700 11px system-ui, sans-serif";
       ctx.fillStyle = "#fff"; ctx.textAlign = "center"; ctx.textBaseline = "middle";
-      ctx.fillText(n.is_root ? "R" : n.rank === INF ? "?" : ofMode === "hop" ? String(n.rank) : n.rank.toFixed(1), n.x, n.y);
+      ctx.fillText(isDead ? "X" : n.is_root ? "R" : n.rank === INF ? "?" : ofMode === "hop" ? String(n.rank) : n.rank.toFixed(1), n.x, n.y);
       if (showLabels) {
-        ctx.font = "10px ui-monospace, Consolas, monospace"; ctx.fillStyle = isSel ? "#bfdbfe" : "#64748b";
+        ctx.font = "10px ui-monospace, Consolas, monospace"; ctx.fillStyle = isDead ? "#94a3b8" : isSel ? "#bfdbfe" : "#64748b";
         ctx.textAlign = "center"; ctx.textBaseline = "top";
-        ctx.fillText(n.id, n.x, n.y + nr + 4);
+        ctx.fillText(isDead ? `${n.id} DEAD` : n.id, n.x, n.y + nr + 4);
       }
       if (n.manual) {
         ctx.font = "bold 9px system-ui, sans-serif";
@@ -1170,7 +1722,9 @@ export default function RPLSimulator() {
   const selN = selNode ? nodes.find(n => n.id === selNode.id) : null;
   const phBadge = { idle: ["#475569","IDLE"], building: ["#3b82f6","RUNNING"], done: ["#22c55e","DONE"] }[phase] || ["#475569","IDLE"];
   const riskNode = energyReport?.predictions?.length
-    ? [...energyReport.predictions].sort((a, b) => (b.predicted_drain + (100 - b.energy_pct) * 0.04) - (a.predicted_drain + (100 - a.energy_pct) * 0.04))[0]
+    ? [...energyReport.predictions]
+        .filter(p => !isDeadNode(nodes.find(n => n.id === p.id)))
+        .sort((a, b) => (b.predicted_drain + (100 - b.energy_pct) * 0.04) - (a.predicted_drain + (100 - a.energy_pct) * 0.04))[0]
     : null;
 
   // Scroll active step into view
@@ -1284,8 +1838,12 @@ export default function RPLSimulator() {
       if (!res.ok) throw new Error(data.detail || "Gemini chat failed");
       setChatMessages([...nextMessages, { role: "assistant", text: data.reply || "No reply received." }]);
     } catch (err) {
-      setChatError(err.message || "Could not contact Gemini.");
-      setChatMessages([...nextMessages, { role: "assistant", text: "I could not reach Gemini yet. Make sure the backend has GEMINI_API_KEY set, then try again." }]);
+      const errorText = err.message || "Could not contact Gemini.";
+      setChatError(errorText);
+      setChatMessages([...nextMessages, {
+        role: "assistant",
+        text: `Gemini could not answer because the backend returned: ${errorText}`,
+      }]);
     } finally {
       setChatBusy(false);
     }
@@ -1298,36 +1856,37 @@ export default function RPLSimulator() {
 
   const palettes = {
     dark: {
-      bg: "#040914", bg2: "#081425", bg3: "#10213b", bg4: "#0d1a30",
-      br: "#1f3654", br2: "#2d5378",
-      tx: "#edf5ff", tx2: "#a9bbd2", tx3: "#64748b",
-      ac: "#3b82f6", ok: "#22c55e", warn: "#f59e0b", err: "#ef4444",
-      rootBg: "radial-gradient(circle at 20% 0%,#0e2748 0,#040914 42%,#020610 100%)",
-      topBg: "linear-gradient(180deg,rgba(8,20,37,.96),rgba(4,9,20,.92))",
-      panelBg: "linear-gradient(180deg,rgba(8,20,37,.97),rgba(4,9,20,.96))",
-      railBg: "linear-gradient(180deg,rgba(8,20,37,.96),rgba(4,9,20,.94))",
-      canvasShellBg: "radial-gradient(circle at 50% 30%,rgba(15,30,58,.55),rgba(4,9,20,.4) 44%,rgba(2,6,16,.72))",
-      canvasFill: "#060d1a",
-      gridLine: "rgba(59,130,246,0.05)",
-      rangeFill: "rgba(59,130,246,0.06)",
-      linkGhost: "rgba(59,130,246,0.1)",
-      overlayBg: "linear-gradient(180deg,rgba(8,20,37,.92),rgba(4,9,20,.82))",
-      overlayBgStrong: "linear-gradient(180deg,rgba(10,20,40,0.94),rgba(6,13,26,0.86))",
-      manualBg: "linear-gradient(180deg,rgba(16,33,59,.96),rgba(4,9,20,.88))",
-      minimapBg: "rgba(6,13,26,0.9)",
-      rowAlt: "#0b1830",
-      rowBorder: "#0f1e3a",
-      disabledBg: "rgba(15,30,58,.22)",
-      sideBg: "rgba(10,20,40,.42)",
-      sideActiveBg: "linear-gradient(180deg,#123568,#0d2342)",
-      sideActiveTx: "#93c5fd",
-      tabActive: "#60a5fa",
-      logoSub: "#7dd3fc",
-      controlBg: "rgba(8,20,37,.58)",
-      cardBg: "rgba(15,30,58,.54)",
-      subtleShadow: "0 10px 34px rgba(0,0,0,.24)",
-      panelShadow: "-12px 0 34px rgba(0,0,0,.20)",
-      railShadow: "8px 0 30px rgba(0,0,0,.18)",
+      bg: "#050a12", bg2: "#071723", bg3: "#102236", bg4: "#0d1c2a",
+      br: "rgba(125,211,252,.22)", br2: "rgba(45,212,191,.42)",
+      tx: "#f4fbff", tx2: "#b7c8d8", tx3: "#71869b",
+      ac: "#38bdf8", ok: "#34d399", warn: "#fbbf24", err: "#fb7185",
+      rootBg: "linear-gradient(135deg,#07111b 0%,#081a25 48%,#07101a 100%)",
+      topBg: "linear-gradient(180deg,rgba(8,24,36,.94),rgba(6,14,24,.88))",
+      panelBg: "linear-gradient(180deg,rgba(8,24,36,.96),rgba(6,14,24,.95))",
+      railBg: "linear-gradient(180deg,rgba(8,24,36,.95),rgba(6,14,24,.92))",
+      canvasShellBg: "linear-gradient(135deg,rgba(5,10,18,.42),rgba(8,28,38,.30) 48%,rgba(7,15,24,.40))",
+      canvasFill: "#07111b",
+      gridLine: "rgba(125,211,252,0.055)",
+      rangeFill: "rgba(45,212,191,0.075)",
+      linkGhost: "rgba(56,189,248,0.14)",
+      overlayBg: "linear-gradient(180deg,rgba(8,25,37,.86),rgba(5,10,18,.74))",
+      overlayBgStrong: "linear-gradient(180deg,rgba(9,28,42,.96),rgba(6,14,24,.88))",
+      manualBg: "linear-gradient(180deg,rgba(34,22,56,.96),rgba(7,17,29,.9))",
+      minimapBg: "rgba(6,16,24,0.82)",
+      creditBg: "linear-gradient(180deg,rgba(9,28,42,.72),rgba(6,14,24,.62))",
+      rowAlt: "rgba(16,34,54,.55)",
+      rowBorder: "rgba(125,211,252,.08)",
+      disabledBg: "rgba(20,35,48,.32)",
+      sideBg: "rgba(10,27,39,.55)",
+      sideActiveBg: "linear-gradient(180deg,rgba(45,212,191,.22),rgba(56,189,248,.12))",
+      sideActiveTx: "#7dd3fc",
+      tabActive: "#67e8f9",
+      logoSub: "#5eead4",
+      controlBg: "rgba(8,25,37,.62)",
+      cardBg: "linear-gradient(180deg,rgba(16,34,54,.64),rgba(8,20,34,.48))",
+      subtleShadow: "0 14px 34px rgba(0,0,0,.24)",
+      panelShadow: "-14px 0 34px rgba(0,0,0,.20)",
+      railShadow: "10px 0 34px rgba(0,0,0,.20)",
     },
     soft: {
       bg: "#f7fbff", bg2: "#edf5fb", bg3: "#e7f0f8", bg4: "#f2f7fb",
@@ -1347,6 +1906,7 @@ export default function RPLSimulator() {
       overlayBgStrong: "linear-gradient(180deg,rgba(255,255,255,.95),rgba(232,244,251,.9))",
       manualBg: "linear-gradient(180deg,rgba(252,250,255,.96),rgba(241,236,252,.9))",
       minimapBg: "rgba(250,253,255,0.92)",
+      creditBg: "linear-gradient(180deg,rgba(255,255,255,.78),rgba(235,245,252,.72))",
       rowAlt: "#eef6fb",
       rowBorder: "#d7e5f1",
       disabledBg: "rgba(202,218,232,.35)",
@@ -1363,6 +1923,19 @@ export default function RPLSimulator() {
     },
   };
   const C = palettes[theme];
+  const guideSteps = [
+    "Load the lab and reset network state.",
+    "Build the DODAG with DIO and DAO routing messages.",
+    "Send DATA traffic to the Base Station and return ACKs.",
+    "Drain energy, score ML risk, and reveal hotspot pressure.",
+    "Repair overloaded parents through local parent re-election.",
+    "Compare OF0 Hop Count with MRHOF ETX.",
+  ];
+  const hoverInfo = hovNode ? {
+    node: hovNode,
+    issue: hotspots.find(h => h.node_id === hovNode.id),
+    route: getRouteNodeIds(hovNode.id).join(" -> ") || "not joined",
+  } : null;
   const statusBanner = mlStatus === "running"
     ? { color: C.warn, title: "ML ENERGY PREDICTION", detail: "Estimating drain and hotspot risk" }
     : phase === "building"
@@ -1374,8 +1947,8 @@ export default function RPLSimulator() {
           : { color: C.tx3, title: "SIMULATOR IDLE", detail: "Run or step to build the network" };
   const selectStyle = {
     fontSize:10,
-    padding:"5px 8px",
-    borderRadius:7,
+    padding:"6px 9px",
+    borderRadius:9,
     border:`1px solid ${C.br}`,
     background:C.controlBg,
     color:C.tx2,
@@ -1386,17 +1959,20 @@ export default function RPLSimulator() {
     display:"inline-flex",
     alignItems:"center",
     gap:4,
-    padding:"4px 7px",
-    borderRadius:8,
+    padding:"5px 8px",
+    borderRadius:10,
     background:C.controlBg,
     border:`1px solid ${C.br}`,
     whiteSpace:"nowrap",
   };
+  const iconSize = 15;
+  const panelVisible = panelOpen || !isCompact;
 
-  function Btn({ children, onClick, disabled, color, title }) {
+  function Btn({ children, onClick, disabled, color, title, icon: Icon }) {
     return (
       <button type="button" title={title} onClick={onClick} disabled={disabled}
-        style={{ display:"inline-flex",alignItems:"center",gap:6,padding:"8px 12px",minHeight:34,borderRadius:8,border:`1px solid ${disabled?C.br:(color||C.ac)+"66"}`,cursor:disabled?"not-allowed":"pointer",fontSize:11,fontWeight:800,color:disabled?C.tx3:(color||C.ac),background:disabled?C.disabledBg:`linear-gradient(180deg,${(color||C.ac)+"24"},${(color||C.ac)+"0f"})`,whiteSpace:"nowrap",opacity:disabled?0.5:1,boxShadow:disabled?"none":`0 8px 22px ${(color||C.ac)+"12"}`,transition:"transform .16s ease, border-color .16s ease, background .16s ease",pointerEvents:"auto" }}>
+        style={{ display:"inline-flex",alignItems:"center",gap:7,padding:"8px 12px",minHeight:36,borderRadius:10,border:`1px solid ${disabled?C.br:(color||C.ac)+"72"}`,cursor:disabled?"not-allowed":"pointer",fontSize:11,fontWeight:850,color:disabled?C.tx3:(color||C.ac),background:disabled?C.disabledBg:`linear-gradient(180deg,${(color||C.ac)+"2c"},${(color||C.ac)+"10"})`,whiteSpace:"nowrap",opacity:disabled?0.52:1,boxShadow:disabled?"none":`0 10px 28px ${(color||C.ac)+"18"}, inset 0 1px 0 rgba(255,255,255,.06)`,transition:"transform .16s ease, border-color .16s ease, background .16s ease",pointerEvents:"auto" }}>
+        {Icon ? <Icon size={iconSize} strokeWidth={2.3} /> : null}
         {children}
       </button>
     );
@@ -1404,7 +1980,7 @@ export default function RPLSimulator() {
   function SideBtn({ icon, active, onClick, title }) {
     return (
       <button type="button" title={title} onClick={onClick}
-        style={{ width:38,height:38,borderRadius:9,border:`1px solid ${active?C.ac:C.br}`,background:active?C.sideActiveBg:C.sideBg,color:active?C.sideActiveTx:C.tx3,cursor:"pointer",fontSize:15,display:"flex",alignItems:"center",justifyContent:"center",boxShadow:active?"0 0 18px rgba(37,99,235,.18)":"none",transition:"background .16s ease, color .16s ease, border-color .16s ease",pointerEvents:"auto" }}>
+        style={{ width:40,height:40,borderRadius:12,border:`1px solid ${active?C.ac:C.br}`,background:active?C.sideActiveBg:C.sideBg,color:active?C.sideActiveTx:C.tx3,cursor:"pointer",fontSize:15,display:"flex",alignItems:"center",justifyContent:"center",boxShadow:active?`0 0 24px ${C.ac}2b, inset 0 1px 0 rgba(255,255,255,.08)`:"inset 0 1px 0 rgba(255,255,255,.04)",transition:"background .16s ease, color .16s ease, border-color .16s ease",pointerEvents:"auto" }}>
         {icon}
       </button>
     );
@@ -1413,7 +1989,7 @@ export default function RPLSimulator() {
     const a = activeTab === id;
     return (
       <button type="button" onClick={() => setActiveTab(id)}
-        style={{ flex:1,padding:"11px 2px",fontSize:9,fontWeight:a?800:600,color:a?C.tabActive:C.tx3,background:a?C.bg3:"transparent",border:"none",borderBottom:`2px solid ${a?C.ac:"transparent"}`,cursor:"pointer",letterSpacing:".05em",textTransform:"uppercase",position:"relative",display:"flex",alignItems:"center",justifyContent:"center",gap:4,transition:"background .16s ease, color .16s ease" }}>
+        style={{ flex:1,padding:"12px 2px",fontSize:9,fontWeight:a?900:650,color:a?C.tabActive:C.tx3,background:a?`linear-gradient(180deg,${C.ac}18,transparent)`: "transparent",border:"none",borderBottom:`2px solid ${a?C.ac:"transparent"}`,cursor:"pointer",letterSpacing:".06em",textTransform:"uppercase",position:"relative",display:"flex",alignItems:"center",justifyContent:"center",gap:4,transition:"background .16s ease, color .16s ease" }}>
         {label}
         {badge ? <span style={{ fontSize:8,padding:"0px 4px",borderRadius:6,background:C.warn,color:"#000",fontWeight:700 }}>{badge}</span> : null}
       </button>
@@ -1424,23 +2000,25 @@ export default function RPLSimulator() {
     <div style={{ display:"flex",flexDirection:"column",height:"100vh",background:C.rootBg,fontFamily:"Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",color:C.tx,fontSize:12,letterSpacing:0,overflow:"hidden" }}>
 
       {/* TOP BAR */}
-      <div style={{ display:"flex",alignItems:"center",minHeight:68,background:C.topBg,borderBottom:`1px solid ${C.br}`,padding:"10px 16px",gap:10,flexShrink:0,boxShadow:C.subtleShadow,backdropFilter:"blur(12px)",flexWrap:"wrap",position:"relative",zIndex:20,pointerEvents:"auto" }}>
+      <div style={{ display:"flex",alignItems:"center",minHeight:72,background:C.topBg,borderBottom:`1px solid ${C.br}`,padding:"11px 16px",gap:10,flexShrink:0,boxShadow:C.subtleShadow,backdropFilter:"blur(16px)",flexWrap:"wrap",position:"relative",zIndex:20,pointerEvents:"auto" }}>
         <div style={{ display:"flex",alignItems:"center",gap:10,marginRight:4,minWidth:190 }}>
-          <div style={{ width:34,height:34,borderRadius:9,background:"linear-gradient(135deg,#06b6d4,#2563eb 52%,#7c3aed)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:15,boxShadow:"0 0 24px rgba(6,182,212,.28)" }}>⬡</div>
+          <div style={{ width:38,height:38,borderRadius:12,background:"linear-gradient(135deg,#22d3ee,#34d399 48%,#a78bfa)",display:"flex",alignItems:"center",justifyContent:"center",fontSize:15,boxShadow:"0 14px 34px rgba(45,212,191,.28), inset 0 1px 0 rgba(255,255,255,.32)" }}><Radio size={19} color="#041014" strokeWidth={2.8} /></div>
           <div>
-            <div style={{ fontSize:15,fontWeight:900,letterSpacing:0,lineHeight:1.2 }}>RPL Web Simulator</div>
-            <div style={{ fontSize:9,color:"#7dd3fc",letterSpacing:".06em",fontWeight:700 }}>RFC 6550 · ML ENERGY ROUTING</div>
+            <div style={{ fontSize:16,fontWeight:950,letterSpacing:0,lineHeight:1.15 }}>RPL Web Simulator</div>
+            <div style={{ fontSize:9,color:C.logoSub,letterSpacing:".08em",fontWeight:800 }}>RFC 6550 / ML ENERGY ROUTING</div>
           </div>
         </div>
         <div style={{ width:1,height:26,background:C.br }} />
-        <Btn onClick={animate} disabled={simRunning} color={C.ok}>▶ Run</Btn>
-        <Btn onClick={stepOne} disabled={simRunning} color={C.ac}>⏭ Step</Btn>
-        <Btn onClick={resetDodag} color={C.err}>↺ Reset</Btn>
+        <Btn onClick={animate} disabled={simRunning} color={C.ok} icon={Play}>Run</Btn>
+        <Btn onClick={stepOne} disabled={simRunning} color={C.ac} icon={StepForward}>Step</Btn>
+        <Btn onClick={resetDodag} color={C.err} icon={RotateCcw}>Reset</Btn>
         <div style={{ width:1,height:26,background:C.br }} />
-        <Btn onClick={transmitDataToBase} disabled={simRunning || !nodes.some(n=>!n.is_root&&n.joined&&n.parent)} color="#06b6d4">⇪ Send Data</Btn>
-        <Btn onClick={drainEnergy} disabled={phase!=="done"||mlStatus==="running"} color={C.warn}>{mlStatus==="running"?"ML...":"⚡ Drain"}</Btn>
-        <Btn onClick={resolveIssues} disabled={phase!=="done"||hotspots.length===0} color="#a855f7">🔧 Fix</Btn>
-        <Btn onClick={explainCurrentSimulation} disabled={chatBusy} color="#38bdf8">AI Explain</Btn>
+        <Btn onClick={transmitDataToBase} disabled={simRunning || !nodes.some(n=>!isDeadNode(n)&&!n.is_root&&n.joined&&n.parent)} color="#06b6d4" icon={Send}>Send Data</Btn>
+        <Btn onClick={drainEnergy} disabled={phase!=="done"||mlStatus==="running"} color={C.warn} icon={Zap}>{mlStatus==="running"?"ML...":"Drain"}</Btn>
+        <Btn onClick={resolveIssues} disabled={phase!=="done"||hotspots.length===0} color="#a855f7" icon={Wrench}>Fix</Btn>
+        <Btn onClick={runGuidedDemo} disabled={guideRunning || simRunning} color="#22d3ee" icon={Sparkles}>{guideRunning ? "Tour..." : "Tour"}</Btn>
+        <Btn onClick={exportReport} color="#14b8a6" icon={Download}>Report</Btn>
+        <Btn onClick={explainCurrentSimulation} disabled={chatBusy} color="#38bdf8" icon={Bot}>AI Explain</Btn>
         <div style={{ width:1,height:26,background:C.br }} />
         <label style={{ fontSize:10,color:C.tx3,display:"flex",alignItems:"center",gap:5 }}>OF:
           <select value={ofMode} onChange={e=>{setOfMode(e.target.value);resetDodag();}} style={selectStyle}>
@@ -1462,6 +2040,7 @@ export default function RPLSimulator() {
             <option value="soft">Soft Light</option>
           </select>
         </label>
+        {isCompact && <Btn onClick={()=>setPanelOpen(v=>!v)} color={C.tx2} icon={Menu}>{panelOpen ? "Hide Panel" : "Panel"}</Btn>}
         <span style={{ fontSize:10,padding:"3px 10px",borderRadius:10,background:phBadge[0]+"22",color:phBadge[0],border:`1px solid ${phBadge[0]}44`,fontWeight:700,letterSpacing:".06em" }}>{phBadge[1]}</span>
         <div style={{ display:"flex",gap:6,fontSize:10,color:C.tx3,flexWrap:"wrap" }}>
           <span style={topStatStyle}>DIO <b style={{ color:C.ac }}>{dioCount}</b></span>
@@ -1476,19 +2055,19 @@ export default function RPLSimulator() {
       <div style={{ display:"flex",flex:1,minHeight:0 }}>
 
         {/* LEFT TOOLBAR */}
-        <div style={{ width:60,background:C.railBg,borderRight:`1px solid ${C.br}`,display:"flex",flexDirection:"column",alignItems:"center",padding:"14px 0",gap:7,flexShrink:0,boxShadow:C.railShadow,position:"relative",zIndex:10,pointerEvents:"auto" }}>
-          <SideBtn icon="↖" active={mode==="sel"} onClick={()=>setMode("sel")} title="Select & drag" />
-          <SideBtn icon="＋" active={mode==="add"} onClick={()=>setMode(mode==="add"?"sel":"add")} title="Click canvas to add node" />
-          <SideBtn icon="－" active={mode==="rem"} onClick={()=>setMode(mode==="rem"?"sel":"rem")} title="Click node to remove" />
+        <div style={{ width:64,background:C.railBg,borderRight:`1px solid ${C.br}`,display:"flex",flexDirection:"column",alignItems:"center",padding:"14px 0",gap:8,flexShrink:0,boxShadow:C.railShadow,position:"relative",zIndex:10,pointerEvents:"auto",backdropFilter:"blur(14px)" }}>
+          <SideBtn icon={<MousePointer2 size={17} />} active={mode==="sel"} onClick={()=>setMode("sel")} title="Select & drag" />
+          <SideBtn icon={<Plus size={18} />} active={mode==="add"} onClick={()=>setMode(mode==="add"?"sel":"add")} title="Click canvas to add node" />
+          <SideBtn icon={<Trash2 size={17} />} active={mode==="rem"} onClick={()=>setMode(mode==="rem"?"sel":"rem")} title="Click node to remove" />
           <div style={{ width:28,height:1,background:C.br,margin:"4px 0" }} />
-          <SideBtn icon="M" active={manualInsert} onClick={()=>{setManualInsert(v=>!v);setMode("add");}} title="Manual insertion: rank, base distance, energy" />
-          <SideBtn icon="⊕" active={false} onClick={addNodeClick} title="Add node randomly" />
+          <SideBtn icon={<Settings2 size={17} />} active={manualInsert} onClick={()=>{setManualInsert(v=>!v);setMode("add");}} title="Manual insertion: rank, base distance, energy" />
+          <SideBtn icon={<LocateFixed size={17} />} active={false} onClick={addNodeClick} title="Add node randomly" />
           <div style={{ width:28,height:1,background:C.br,margin:"4px 0" }} />
-          <SideBtn icon="◎" active={showRange} onClick={()=>setShowRange(v=>!v)} title="Toggle radio range" />
-          <SideBtn icon="⋯" active={showLinks} onClick={()=>setShowLinks(v=>!v)} title="Toggle radio links" />
-          <SideBtn icon="𝐓" active={showLabels} onClick={()=>setShowLabels(v=>!v)} title="Toggle labels" />
-          <SideBtn icon="ε" active={showETX} onClick={()=>setShowETX(v=>!v)} title="Toggle ETX" />
-          <SideBtn icon="◒" active={showHeatmap} onClick={()=>setShowHeatmap(v=>!v)} title="Toggle ML energy heatmap" />
+          <SideBtn icon={<Radio size={17} />} active={showRange} onClick={()=>setShowRange(v=>!v)} title="Toggle radio range" />
+          <SideBtn icon={<Layers size={17} />} active={showLinks} onClick={()=>setShowLinks(v=>!v)} title="Toggle radio links" />
+          <SideBtn icon={<Tag size={17} />} active={showLabels} onClick={()=>setShowLabels(v=>!v)} title="Toggle labels" />
+          <SideBtn icon={<Gauge size={17} />} active={showETX} onClick={()=>setShowETX(v=>!v)} title="Toggle ETX" />
+          <SideBtn icon={<Radar size={17} />} active={showHeatmap} onClick={()=>setShowHeatmap(v=>!v)} title="Toggle ML energy heatmap" />
         </div>
 
         {/* CANVAS */}
@@ -1497,11 +2076,27 @@ export default function RPLSimulator() {
             onMouseMove={onMouseMove} onMouseDown={onMouseDown} onMouseUp={onMouseUp}
             onMouseLeave={()=>{ setHovNode(null); setHovBaseStation(false); if(cvRef.current) cvRef.current.style.cursor="default"; }} />
 
-          <div style={{ position:"absolute",right:14,bottom:14,width:"min(260px, calc(100% - 28px))",background:C.overlayBgStrong,border:`1px solid ${statusBanner.color}66`,borderRadius:8,padding:"8px 12px",boxShadow:`0 10px 30px ${statusBanner.color}1f`,backdropFilter:"blur(12px)",pointerEvents:"none",display:"flex",alignItems:"center",gap:10 }}>
-            <span style={{ width:10,height:10,borderRadius:"50%",background:statusBanner.color,boxShadow:`0 0 18px ${statusBanner.color}` }} />
+          {hoverInfo && (
+            <div style={{ position:"absolute",left:Math.min(Math.max(12, hoverInfo.node.x + 24), Math.max(12, (cvRef.current?.offsetWidth || 680) - 238)),top:Math.min(Math.max(12, hoverInfo.node.y - 86), Math.max(12, (cvRef.current?.offsetHeight || 560) - 154)),width:214,background:C.overlayBgStrong,border:`1px solid ${hoverInfo.issue ? C.warn+"88" : C.br}`,borderRadius:8,padding:"10px 11px",boxShadow:C.subtleShadow,backdropFilter:"blur(12px)",pointerEvents:"none",zIndex:8,textAlign:"left" }}>
+              <div style={{ display:"flex",alignItems:"center",justifyContent:"space-between",gap:8,marginBottom:8 }}>
+                <span style={{ fontFamily:"monospace",fontSize:12,color:hoverInfo.node.is_root?C.err:C.tx,fontWeight:900 }}>{hoverInfo.node.id}</span>
+                <span style={{ fontSize:8,padding:"2px 6px",borderRadius:6,background:isDeadNode(hoverInfo.node)?"#64748b22":hoverInfo.issue?C.warn+"22":C.ok+"22",color:isDeadNode(hoverInfo.node)?"#94a3b8":hoverInfo.issue?C.warn:C.ok,fontWeight:900 }}>{isDeadNode(hoverInfo.node) ? "dead" : hoverInfo.issue ? hoverInfo.issue.flags.join(" + ") : hoverInfo.node.joined ? "joined" : "unjoined"}</span>
+              </div>
+              {[["Rank", isDeadNode(hoverInfo.node) ? "null" : hoverInfo.node.rank === INF ? "inf" : hoverInfo.node.rank],["Parent", isDeadNode(hoverInfo.node) ? "null" : hoverInfo.node.parent || "none"],["Battery", `${Math.round(hoverInfo.node.energy_pct)}%`],["Children", isDeadNode(hoverInfo.node) ? 0 : hoverInfo.node.children.length],["TX/RX", `${hoverInfo.node.traffic_tx}/${hoverInfo.node.traffic_rx}`]].map(([k,v]) => (
+                <div key={k} style={{ display:"flex",justifyContent:"space-between",fontSize:10,lineHeight:1.8,color:C.tx3 }}>
+                  <span>{k}</span><b style={{ color:C.tx2,fontFamily:k==="Parent"?"monospace":"inherit" }}>{v}</b>
+                </div>
+              ))}
+              <div style={{ marginTop:6,paddingTop:6,borderTop:`1px solid ${C.br}`,fontSize:9,color:C.tx3,lineHeight:1.45,overflowWrap:"anywhere" }}>Route: {hoverInfo.route}</div>
+            </div>
+          )}
+
+          <div style={{ position:"absolute",right:14,bottom:14,width:"min(286px, calc(100% - 28px))",background:C.overlayBgStrong,border:`1px solid ${statusBanner.color}88`,borderRadius:14,padding:"12px 14px",boxShadow:`0 18px 54px ${statusBanner.color}2e, inset 0 1px 0 rgba(255,255,255,.09)`,backdropFilter:"blur(18px)",pointerEvents:"none",display:"flex",alignItems:"center",gap:12,overflow:"hidden" }}>
+            <span style={{ position:"absolute",left:0,top:0,bottom:0,width:4,background:statusBanner.color,boxShadow:`0 0 24px ${statusBanner.color}` }} />
+            <span style={{ width:12,height:12,borderRadius:"50%",background:statusBanner.color,boxShadow:`0 0 22px ${statusBanner.color}` }} />
             <div style={{ textAlign:"left",minWidth:0 }}>
-              <div style={{ fontSize:10,fontWeight:900,color:statusBanner.color,letterSpacing:".08em",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis" }}>{statusBanner.title}</div>
-              <div style={{ fontSize:10,color:C.tx3,marginTop:2 }}>{statusBanner.detail}</div>
+              <div style={{ fontSize:10,fontWeight:950,color:statusBanner.color,letterSpacing:".09em",whiteSpace:"nowrap",overflow:"hidden",textOverflow:"ellipsis" }}>{statusBanner.title}</div>
+              <div style={{ fontSize:10,color:C.tx2,marginTop:3 }}>{statusBanner.detail}</div>
             </div>
           </div>
 
@@ -1516,18 +2111,32 @@ export default function RPLSimulator() {
             </div>
           )}
 
+          {guideOpen && (
+            <div style={{ position:"absolute",top:12,left:"50%",transform:"translateX(-50%)",width:"min(430px, calc(100% - 28px))",background:C.overlayBgStrong,border:`1px solid ${C.ac}66`,borderRadius:8,padding:"10px 12px",boxShadow:C.subtleShadow,backdropFilter:"blur(12px)",zIndex:9,textAlign:"left" }}>
+              <div style={{ display:"flex",alignItems:"center",justifyContent:"space-between",gap:10,marginBottom:8 }}>
+                <div style={{ display:"flex",alignItems:"center",gap:8,color:C.tx,fontWeight:900,fontSize:11 }}><Sparkles size={15} color="#22d3ee" /> Guided Demo</div>
+                <button type="button" onClick={()=>{setGuideOpen(false);setGuideRunning(false);}} style={{ border:`1px solid ${C.br}`,background:C.controlBg,color:C.tx2,borderRadius:6,cursor:"pointer",fontSize:10,padding:"3px 7px" }}>Close</button>
+              </div>
+              <div style={{ display:"grid",gridTemplateColumns:`repeat(${guideSteps.length}, 1fr)`,gap:5,marginBottom:8 }}>
+                {guideSteps.map((_, i) => <div key={i} style={{ height:5,borderRadius:4,background:i<=guideStep?C.ac:C.br }} />)}
+              </div>
+              <div style={{ fontSize:12,color:C.tx2,lineHeight:1.5 }}>{guideSteps[guideStep] || guideSteps[0]}</div>
+            </div>
+          )}
+
           {/* Stats overlay */}
-          <div style={{ position:"absolute",top:12,left:12,background:C.overlayBg,border:`1px solid ${C.br}`,borderRadius:8,padding:"10px 13px",fontSize:10,color:C.tx3,lineHeight:1.9,boxShadow:C.subtleShadow,backdropFilter:"blur(10px)" }}>
-            <div style={{ color:C.tx2,fontWeight:700,marginBottom:3,letterSpacing:".06em",fontSize:9 }}>NETWORK</div>
-            <div>Nodes <span style={{ color:C.tx,float:"right",marginLeft:18 }}>{nodes.length}</span></div>
-            <div>Joined <span style={{ color:C.ok,float:"right" }}>{nodes.filter(n=>n.joined||n.is_root).length}</span></div>
-            <div>Links <span style={{ color:C.ac,float:"right" }}>{nodes.filter(n=>n.parent).length}</span></div>
+          <div style={{ position:"absolute",top:12,left:12,background:C.overlayBg,border:`1px solid ${C.br2}`,borderRadius:14,padding:"12px 15px",fontSize:10,color:C.tx3,lineHeight:1.9,boxShadow:C.subtleShadow,backdropFilter:"blur(18px)" }}>
+            <div style={{ color:C.tx2,fontWeight:850,marginBottom:4,letterSpacing:".08em",fontSize:9,display:"flex",alignItems:"center",gap:6 }}><Activity size={12} color={C.ac} /> NETWORK</div>
+            <div>Nodes <span style={{ color:C.tx,float:"right",marginLeft:18 }}>{nodes.filter(n=>!isDeadNode(n)).length}</span></div>
+            <div>Joined <span style={{ color:C.ok,float:"right" }}>{nodes.filter(n=>!isDeadNode(n)&&(n.joined||n.is_root)).length}</span></div>
+            <div>Links <span style={{ color:C.ac,float:"right" }}>{nodes.filter(n=>!isDeadNode(n)&&n.parent).length}</span></div>
+            {nodes.some(isDeadNode)&&<div>Dead <span style={{ color:"#94a3b8",float:"right" }}>{nodes.filter(isDeadNode).length}</span></div>}
             {hotspots.length>0&&<div>Issues <span style={{ color:C.warn,float:"right" }}>{hotspots.length}</span></div>}
             {analytics&&<div>Health <span style={{ color:analytics.health>70?C.ok:C.warn,float:"right" }}>{analytics.health}/100</span></div>}
           </div>
 
           {riskNode && (
-            <div style={{ position:"absolute",top:12,right:12,width:210,background:C.overlayBgStrong,border:"1px solid rgba(6,182,212,0.38)",borderRadius:8,padding:"10px 12px",boxShadow:C.subtleShadow,backdropFilter:"blur(10px)" }}>
+            <div style={{ position:"absolute",top:12,right:12,width:220,background:C.overlayBgStrong,border:"1px solid rgba(6,182,212,0.42)",borderRadius:12,padding:"11px 13px",boxShadow:C.subtleShadow,backdropFilter:"blur(14px)" }}>
               <div style={{ display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8 }}>
                 <span style={{ fontSize:9,color:"#67e8f9",fontWeight:800,letterSpacing:".08em" }}>ML RISK RADAR</span>
                 <span style={{ width:8,height:8,borderRadius:"50%",background:mlStatus==="backend"?"#22c55e":"#f59e0b",boxShadow:`0 0 14px ${mlStatus==="backend"?"#22c55e":"#f59e0b"}` }} />
@@ -1576,14 +2185,14 @@ export default function RPLSimulator() {
           )}
 
           {/* Legend */}
-          <div style={{ position:"absolute",bottom:12,left:12,background:C.overlayBg,border:`1px solid ${C.br}`,borderRadius:8,padding:"9px 12px",fontSize:10,color:C.tx3,lineHeight:2,boxShadow:C.subtleShadow,backdropFilter:"blur(10px)" }}>
-            {[["#ef4444","R = DODAG root"],["#06b6d4","Tower = Base Station"],["#22c55e","● Joined node (rank)"],["#334155","● Unjoined node"],["#f59e0b","🔥 Hotspot / relay"],["#3b82f6","→ DIO packet"],["#f59e0b","→ DAO packet"],["#06b6d4","→ DATA to base"],["#a855f7","← ACK from base"]].map(([c,l])=>(
+          <div style={{ position:"absolute",bottom:12,left:12,background:C.overlayBg,border:`1px solid ${C.br}`,borderRadius:14,padding:"10px 13px",fontSize:10,color:C.tx3,lineHeight:2,boxShadow:C.subtleShadow,backdropFilter:"blur(18px)" }}>
+            {[["#ef4444","R = DODAG root"],["#06b6d4","Tower = Base Station"],["#22c55e","● Joined node (rank)"],["#334155","● Unjoined node"],["#64748b","X Dead / ignored"],["#f59e0b","🔥 Hotspot / relay"],["#3b82f6","→ DIO packet"],["#f59e0b","→ DAO packet"],["#06b6d4","→ DATA to base"],["#a855f7","← ACK from base"]].map(([c,l])=>(
               <div key={l} style={{ display:"flex",alignItems:"center",gap:6 }}><div style={{ width:8,height:8,borderRadius:"50%",background:c,flexShrink:0 }} /><span>{l}</span></div>
             ))}
           </div>
 
           {/* Minimap */}
-          <svg style={{ position:"absolute",bottom:12,right:12,width:130,height:86,borderRadius:8,border:`1px solid ${C.br}`,background:C.minimapBg,boxShadow:C.subtleShadow }}>
+          <svg style={{ position:"absolute",bottom:12,right:12,width:136,height:90,borderRadius:12,border:`1px solid ${C.br}`,background:C.minimapBg,boxShadow:C.subtleShadow,backdropFilter:"blur(14px)" }}>
             {(()=>{
               if(!nodes.length) return null;
               const xs=nodes.map(n=>n.x),ys=nodes.map(n=>n.y);
@@ -1593,22 +2202,22 @@ export default function RPLSimulator() {
               const rect=cvRef.current?.getBoundingClientRect();
               const base=currentBaseStation(rect?.width||680,rect?.height||560);
               return<>
-                {nodes.filter(n=>n.parent).map(n=>{const p=nodes.find(x=>x.id===n.parent);if(!p)return null;return<line key={n.id} x1={n.x*sc+ox} y1={n.y*sc+oy} x2={p.x*sc+ox} y2={p.y*sc+oy} stroke="#22c55e77" strokeWidth={1}/>;}) }
+                {nodes.filter(n=>n.parent && !isDeadNode(n)).map(n=>{const p=nodes.find(x=>x.id===n.parent);if(!p || isDeadNode(p))return null;return<line key={n.id} x1={n.x*sc+ox} y1={n.y*sc+oy} x2={p.x*sc+ox} y2={p.y*sc+oy} stroke="#22c55e77" strokeWidth={1}/>;}) }
                 {nodes.filter(n=>n.is_root).map(n=><line key="base-link" x1={n.x*sc+ox} y1={n.y*sc+oy} x2={base.x*sc+ox} y2={base.y*sc+oy} stroke="#06b6d499" strokeWidth={1} strokeDasharray="3 3"/>)}
-                {nodes.map(n=><circle key={n.id} cx={n.x*sc+ox} cy={n.y*sc+oy} r={3} fill={n.is_root?"#ef4444":n.joined?"#22c55e":"#334155"} stroke={selNode?.id===n.id?"#60a5fa":"none"} strokeWidth={1.5}/>)}
+                {nodes.map(n=><circle key={n.id} cx={n.x*sc+ox} cy={n.y*sc+oy} r={3} fill={isDeadNode(n)?"#64748b":n.is_root?"#ef4444":n.joined?"#22c55e":"#334155"} stroke={selNode?.id===n.id?"#60a5fa":"none"} strokeWidth={1.5}/>)}
                 <rect x={base.x*sc+ox-3} y={base.y*sc+oy-3} width={6} height={6} rx={1.5} fill="#06b6d4" />
               </>;
             })()}
           </svg>
 
-          <div style={{ position:"absolute",bottom:12,left:"50%",transform:"translateX(-50%)",background:C.panelBg,border:`1px solid ${C.br}`,borderRadius:8,padding:"7px 16px",color:C.tx2,fontSize:12,fontWeight:800,boxShadow:C.subtleShadow,pointerEvents:"none",zIndex:5 }}>
-            Made By Syed Sobaan Najmi 😉
+          <div style={{ position:"absolute",bottom:12,left:"50%",transform:"translateX(-50%)",background:C.creditBg,border:`1px solid ${C.br}`,borderRadius:999,padding:"7px 16px",color:C.tx2,fontSize:11,fontWeight:800,boxShadow:C.subtleShadow,pointerEvents:"none",zIndex:5,backdropFilter:"blur(12px)" }}>
+            Made By Syed Sobaan Najmi
           </div>
 
         </div>
 
         {/* RIGHT PANEL */}
-        <div style={{ width:340,background:C.panelBg,borderLeft:`1px solid ${C.br}`,display:"flex",flexDirection:"column",flexShrink:0,boxShadow:C.panelShadow }}>
+        {panelVisible && <div style={{ width:isCompact?"min(100vw, 380px)":348,position:isCompact?"absolute":"relative",right:0,top:isCompact?0:"auto",bottom:isCompact?0:"auto",height:isCompact?"100%":"auto",zIndex:isCompact?60:"auto",background:C.panelBg,borderLeft:`1px solid ${C.br}`,display:"flex",flexDirection:"column",flexShrink:0,boxShadow:C.panelShadow,backdropFilter:"blur(16px)" }}>
           <div style={{ display:"flex",borderBottom:`1px solid ${C.br}`,flexShrink:0 }}>
             <TabBtn id="nodes" label="Nodes" />
             <TabBtn id="inspector" label="Inspect" />
@@ -1616,6 +2225,7 @@ export default function RPLSimulator() {
             <TabBtn id="analytics" label="Stats" />
             <TabBtn id="ml" label="ML" />
             <TabBtn id="scenario" label="Scenario" />
+            <TabBtn id="lab" label="Lab" />
           </div>
 
           <div style={{ flex:1,overflow:"hidden auto" }}>
@@ -1625,8 +2235,8 @@ export default function RPLSimulator() {
               <>
               <div style={{ display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8,padding:12,borderBottom:`1px solid ${C.br}` }}>
                 {[
-                  ["Nodes", nodes.length, C.tx],
-                  ["Joined", nodes.filter(n=>n.joined||n.is_root).length, C.ok],
+                  ["Nodes", nodes.filter(n=>!isDeadNode(n)).length, C.tx],
+                  ["Joined", nodes.filter(n=>!isDeadNode(n)&&(n.joined||n.is_root)).length, C.ok],
                   ["Issues", hotspots.length, hotspots.length ? C.warn : C.tx3],
                 ].map(([label,value,color]) => (
                   <div key={label} style={{ padding:"9px 10px",borderRadius:8,background:C.cardBg,border:`1px solid ${C.br}` }}>
@@ -1646,23 +2256,24 @@ export default function RPLSimulator() {
                 <tbody>
                   {nodes.map((n,i)=>{
                     const hs=hotspots.find(h=>h.node_id===n.id);
+                    const dead = isDeadNode(n);
                     return(
                       <tr key={n.id} onClick={()=>{setSelNode(n);setActiveTab("inspector");}}
                         style={{ background:selNode?.id===n.id?C.bg3:i%2===0?"transparent":C.rowAlt,cursor:"pointer",borderBottom:`1px solid ${C.rowBorder}` }}>
-                        <td style={{ padding:"5px 7px",color:n.is_root?C.err:C.tx2,fontFamily:"monospace",fontSize:9 }}>{n.id}</td>
-                        <td style={{ padding:"5px 7px",color:n.rank===INF?C.tx3:"#60a5fa",fontWeight:700 }}>{n.rank===INF?"∞":n.rank}</td>
-                        <td style={{ padding:"5px 7px",color:C.tx3,fontFamily:"monospace",fontSize:8 }}>{n.parent||"—"}</td>
+                        <td style={{ padding:"5px 7px",color:dead?C.tx3:n.is_root?C.err:C.tx2,fontFamily:"monospace",fontSize:9 }}>{n.id}</td>
+                        <td style={{ padding:"5px 7px",color:dead?C.tx3:n.rank===INF?C.tx3:"#60a5fa",fontWeight:700 }}>{dead?"null":n.rank===INF?"∞":n.rank}</td>
+                        <td style={{ padding:"5px 7px",color:C.tx3,fontFamily:"monospace",fontSize:8 }}>{dead?"null":n.parent||"—"}</td>
                         <td style={{ padding:"5px 7px" }}>
                           <div style={{ display:"flex",alignItems:"center",gap:3 }}>
                             <div style={{ width:28,height:4,borderRadius:2,background:C.br,overflow:"hidden" }}>
-                              <div style={{ height:"100%",width:`${n.energy_pct}%`,background:n.energy_pct>50?C.ok:n.energy_pct>25?C.warn:C.err,borderRadius:2 }} />
+                              <div style={{ height:"100%",width:`${n.energy_pct}%`,background:dead?"#64748b":n.energy_pct>50?C.ok:n.energy_pct>25?C.warn:C.err,borderRadius:2 }} />
                             </div>
                             <span style={{ color:C.tx3,fontSize:8 }}>{Math.round(n.energy_pct)}%</span>
                           </div>
                         </td>
                         <td style={{ padding:"5px 7px" }}>
-                          <span style={{ fontSize:8,padding:"1px 5px",borderRadius:4,background:n.joined?"#16a34a22":"#33415522",color:n.joined?"#4ade80":C.tx3 }}>
-                            {n.manual?"M ":""}{hs?(hs.flags.includes("hotspot")?"🔥 ":"⚡ "):""}{n.joined?"joined":"—"}
+                          <span style={{ fontSize:8,padding:"1px 5px",borderRadius:4,background:dead?"#64748b22":n.joined?"#16a34a22":"#33415522",color:dead?"#94a3b8":n.joined?"#4ade80":C.tx3 }}>
+                            {dead ? "dead" : <>{n.manual?"M ":""}{hs?(hs.flags.includes("hotspot")?"🔥 ":"⚡ "):""}{n.joined?"joined":"—"}</>}
                           </span>
                         </td>
                       </tr>
@@ -1679,15 +2290,15 @@ export default function RPLSimulator() {
                 {selN ? (
                   <>
                     <div style={{ display:"flex",alignItems:"center",gap:8,marginBottom:12,paddingBottom:10,borderBottom:`1px solid ${C.br}` }}>
-                      <div style={{ width:38,height:38,borderRadius:8,background:selN.is_root?"#dc2626":selN.joined?"#15803d":C.bg3,display:"flex",alignItems:"center",justifyContent:"center",fontSize:16,fontWeight:800,color:"#fff" }}>
-                        {selN.is_root?"R":selN.rank===INF?"?":selN.rank}
+                      <div style={{ width:38,height:38,borderRadius:8,background:isDeadNode(selN)?"#475569":selN.is_root?"#dc2626":selN.joined?"#15803d":C.bg3,display:"flex",alignItems:"center",justifyContent:"center",fontSize:16,fontWeight:800,color:"#fff" }}>
+                        {isDeadNode(selN)?"X":selN.is_root?"R":selN.rank===INF?"?":selN.rank}
                       </div>
                       <div>
                         <div style={{ fontSize:13,fontWeight:700,fontFamily:"monospace" }}>{selN.id}</div>
-                        <div style={{ fontSize:10,color:selN.is_root?C.err:selN.joined?C.ok:C.tx3 }}>{selN.is_root?"DODAG Root":selN.joined?"Joined":"Unjoined"}</div>
+                        <div style={{ fontSize:10,color:isDeadNode(selN)?"#94a3b8":selN.is_root?C.err:selN.joined?C.ok:C.tx3 }}>{isDeadNode(selN)?"Dead / ignored":selN.is_root?"DODAG Root":selN.joined?"Joined":"Unjoined"}</div>
                       </div>
                     </div>
-                    {[["Node Type",selN.is_root?"Border Router":"Sensor Node"],["Rank",selN.rank===INF?"∞":selN.rank],["Preferred Parent",selN.parent||"None (root)"],["Children",selN.children?.length||0],["ETX",selN.is_root?"N/A":selN.etx?.toFixed(3)],["RX pkts",selN.traffic_rx],["TX pkts",selN.traffic_tx]].map(([k,v])=>(
+                    {[["Node Type",isDeadNode(selN)?"Dead Node":selN.is_root?"Border Router":"Sensor Node"],["Rank",isDeadNode(selN)?"null":selN.rank===INF?"∞":selN.rank],["Preferred Parent",isDeadNode(selN)?"null":selN.parent||"None (root)"],["Children",isDeadNode(selN)?0:selN.children?.length||0],["ETX",selN.is_root||isDeadNode(selN)?"N/A":selN.etx?.toFixed(3)],["RX pkts",selN.traffic_rx],["TX pkts",selN.traffic_tx]].map(([k,v])=>(
                       <div key={k} style={{ display:"flex",justifyContent:"space-between",marginBottom:7,fontSize:11 }}>
                         <span style={{ color:C.tx3 }}>{k}</span>
                         <span style={{ color:C.tx2,fontWeight:500,fontFamily:"monospace" }}>{String(v)}</span>
@@ -1938,8 +2549,57 @@ export default function RPLSimulator() {
                 </div>
               </div>
             )}
+
+            {activeTab==="lab" && (
+              <div style={{ padding:12 }}>
+                <div style={{ display:"flex",alignItems:"center",justifyContent:"space-between",gap:10,marginBottom:12 }}>
+                  <div>
+                    <div style={{ fontSize:14,fontWeight:900,color:C.tx }}>Simulation Lab</div>
+                    <div style={{ fontSize:10,color:C.tx3,marginTop:2 }}>Presets, tour, comparison, and export.</div>
+                  </div>
+                  <Btn onClick={runGuidedDemo} disabled={guideRunning || simRunning} color="#22d3ee" icon={Sparkles}>Tour</Btn>
+                </div>
+
+                <div style={{ fontSize:9,color:C.tx3,letterSpacing:".06em",fontWeight:800,marginBottom:7 }}>SCENARIO PRESETS</div>
+                <div style={{ display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:14 }}>
+                  <Btn onClick={()=>applyPreset("healthy")} color={C.ok} icon={Activity}>Healthy</Btn>
+                  <Btn onClick={()=>applyPreset("dense")} color={C.ac} icon={MapIcon}>Dense</Btn>
+                  <Btn onClick={()=>applyPreset("sparse")} color="#06b6d4" icon={Radio}>Sparse</Btn>
+                  <Btn onClick={()=>applyPreset("low")} color={C.warn} icon={Zap}>Low Battery</Btn>
+                  <Btn onClick={()=>applyPreset("hotspot")} color={C.err} icon={Flame}>Hotspot</Btn>
+                  <Btn onClick={compareModes} color="#a855f7" icon={BarChart3}>Compare OF</Btn>
+                </div>
+
+                <div style={{ display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:14 }}>
+                  <Btn onClick={exportReport} color="#14b8a6" icon={Download}>Export JSON</Btn>
+                  <Btn onClick={()=>setGuideOpen(v=>!v)} color={C.tx2} icon={Info}>{guideOpen?"Hide Tour":"Tour Card"}</Btn>
+                </div>
+
+                {comparison ? (
+                  <div style={{ display:"flex",flexDirection:"column",gap:9 }}>
+                    {Object.values(comparison).map(item => (
+                      <div key={item.mode} style={{ padding:10,borderRadius:8,background:C.cardBg,border:`1px solid ${C.br}` }}>
+                        <div style={{ display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:8 }}>
+                          <span style={{ fontSize:12,fontWeight:900,color:C.tx }}>{item.mode}</span>
+                          <span style={{ fontSize:8,padding:"2px 6px",borderRadius:5,background:C.ac+"22",color:C.ac,fontWeight:900 }}>{item.joined}/{nodes.length} joined</span>
+                        </div>
+                        {[["Links", item.links],["Avg Rank", item.avgRank],["Max Rank", item.maxRank],["DIO Messages", item.messages],["Relay Nodes", item.relays],["Max Children", item.maxChildren]].map(([k,v]) => (
+                          <div key={k} style={{ display:"flex",justifyContent:"space-between",fontSize:10,lineHeight:1.8,color:C.tx3 }}>
+                            <span>{k}</span><b style={{ color:C.tx2 }}>{v}</b>
+                          </div>
+                        ))}
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div style={{ padding:10,borderRadius:8,background:C.cardBg,border:`1px solid ${C.br}`,fontSize:11,color:C.tx3,lineHeight:1.7 }}>
+                    Use Compare OF to score the current topology under OF0 Hop Count and MRHOF ETX without changing the live canvas.
+                  </div>
+                )}
+              </div>
+            )}
           </div>
-        </div>
+        </div>}
       </div>
 
       <div style={{ position:"fixed",right:18,bottom:18,zIndex:80,display:"flex",flexDirection:"column",alignItems:"flex-end",gap:10,pointerEvents:"none" }}>
