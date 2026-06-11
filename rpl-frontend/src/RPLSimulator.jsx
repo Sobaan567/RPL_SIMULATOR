@@ -2596,6 +2596,10 @@ export default function RPLSimulator() {
         </div>}
       </div>
 
+      <footer style={{ flexShrink:0,minHeight:30,display:"flex",alignItems:"center",justifyContent:"center",padding:"6px 14px",background:C.topBg,borderTop:`1px solid ${C.br}`,color:C.tx2,fontSize:11,fontWeight:800,letterSpacing:0,boxShadow:"0 -10px 28px rgba(0,0,0,.12)",zIndex:15 }}>
+        Made By Syed Sobaan Najmi 😎
+      </footer>
+
       <div style={{ position:"fixed",right:18,bottom:18,zIndex:80,display:"flex",flexDirection:"column",alignItems:"flex-end",gap:10,pointerEvents:"none" }}>
         {chatOpen && (
           <div style={{ width:"min(380px, calc(100vw - 36px))",height:"min(560px, calc(100vh - 108px))",background:C.panelBg,border:`1px solid ${C.br2}`,borderRadius:8,boxShadow:"0 22px 70px rgba(0,0,0,.36)",display:"flex",flexDirection:"column",overflow:"hidden",pointerEvents:"auto" }}>
